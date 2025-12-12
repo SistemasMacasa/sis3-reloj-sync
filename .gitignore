@@ -16,3 +16,4 @@ config.ini
 *.bak
 .DS_Store
 Thumbs.db
+last_sync.json
