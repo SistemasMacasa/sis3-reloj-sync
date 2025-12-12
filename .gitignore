@@ -1,0 +1,18 @@
+# Entorno virtual
+.venv/
+venv/
+
+# Archivos de salida
+out/
+__pycache__/
+*.pyc
+
+# Configuración local (no subir secretos)
+config.ini
+
+# Archivos temporales
+*.log
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
