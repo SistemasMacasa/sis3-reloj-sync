@@ -1,19 +1,67 @@
-# Entorno virtual
+# ============================================================
+# .gitignore — sis3-reloj-sync (Windows + Python + PyInstaller)
+# Objetivo:
+# - Mantener el repo limpio (solo código fuente y assets necesarios)
+# - Evitar subir salidas generadas (build/dist/out), cachés y temporales
+# - Proteger secretos locales (config.ini)
+# ============================================================
+
+# ----------------------------
+# Entornos virtuales (Python)
+# ----------------------------
 .venv/
 venv/
 
-# Archivos de salida
-out/
+# ----------------------------
+# Python: caché/bytecode
+# ----------------------------
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 
-# Configuración local (no subir secretos)
+# ----------------------------
+# Configuración local (NO subir secretos)
+# ----------------------------
+# Nota: config.ini contiene credenciales/URLs/keys de entorno local.
 config.ini
 
-# Archivos temporales
+# ----------------------------
+# Archivos de salida / runtime
+# ----------------------------
+# Carpeta estándar de outputs (jsonl, etc.) generados en ejecución
+out/
+
+# Archivos generados en runtime (logs / sincronización)
 *.log
+last_sync.json
+*.jsonl
+
+# ----------------------------
+# PyInstaller (artefactos de build)
+# ----------------------------
+# build/ y dist/ se generan al compilar el .exe; NO se versionan.
+build/
+dist/
+
+# Archivo .spec:
+# - Si lo usas como “receta” reproducible de build, conviene versionarlo.
+# - Si NO lo quieres versionar, deja esta línea activa.
+# - Si SÍ lo quieres versionar, comenta la línea de abajo con un '#'.
+*.spec
+
+# ----------------------------
+# Temporales comunes
+# ----------------------------
 *.tmp
 *.bak
+
+# ----------------------------
+# Basura de SO / IDE
+# ----------------------------
 .DS_Store
 Thumbs.db
-last_sync.json
+
+# (Opcional) VS Code / JetBrains si quisieras ignorarlos:
+# .vscode/
+# .idea/

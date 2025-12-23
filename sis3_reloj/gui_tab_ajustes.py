@@ -5,11 +5,12 @@ from tkinter import ttk
 from .config import save_mode_sis2_disconnected
 
 
-def build_tab_ajustes(parent, *, get_config, set_config_field, log):
+def build_tab_ajustes(parent, *, get_config, set_config_field, log, on_toggle_sis2_disconnected=None):
     """
     get_config(): AppConfig
     set_config_field(name:str, value:any) -> actualiza en memoria (no solo en config.ini)
     log(msg:str)
+    on_toggle_sis2_disconnected(value: bool) -> callback para que gui.py oculte/active la pestaña SIS2
     """
     frame = ttk.Frame(parent, padding=10)
     frame.pack(fill=tk.BOTH, expand=True)
@@ -22,7 +23,7 @@ def build_tab_ajustes(parent, *, get_config, set_config_field, log):
         frame,
         text="Se ha desconectado SIS2 (modo post-SIS2)",
         variable=sis2_disc_var,
-        command=lambda: _on_toggle(sis2_disc_var, set_config_field, log),
+        command=lambda: _on_toggle(sis2_disc_var, set_config_field, log, on_toggle_sis2_disconnected),
     )
     chk.pack(anchor="w", pady=(8, 8))
 
@@ -35,10 +36,13 @@ def build_tab_ajustes(parent, *, get_config, set_config_field, log):
     return frame
 
 
-def _on_toggle(var, set_config_field, log):
+def _on_toggle(var, set_config_field, log, on_toggle_sis2_disconnected=None):
     val = bool(var.get())
     save_mode_sis2_disconnected(val)
     set_config_field("sis2_disconnected", val)
 
-    mode = "POST-SIS2 (podrá limpiar reloj en el futuro)" if val else "COEXISTENCIA con SIS2"
+    mode = "POST-SIS2 (SIS2 desactivado)" if val else "COEXISTENCIA con SIS2"
     log(f"[AJUSTES] Modo cambiado: {mode}")
+
+    if callable(on_toggle_sis2_disconnected):
+        on_toggle_sis2_disconnected(val)

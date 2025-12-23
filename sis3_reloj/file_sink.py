@@ -23,12 +23,16 @@ def write_attendance_jsonl(records: List[AttendanceRecord], base_dir: Path) -> P
 
 def write_users_jsonl(users: list[UserRecord], base_dir: Path) -> Path:
     ensure_dir(base_dir)
-    now = datetime.now()
-    fname = f"usuarios-{now:%Y%m%d-%H%M%S}.jsonl"
-    fpath = base_dir / fname
 
-    with fpath.open("w", encoding="utf-8") as f:
+    # Archivo fijo (snapshot): siempre reemplaza el anterior
+    fpath = base_dir / "usuarios.jsonl"
+    tmp = base_dir / "usuarios.jsonl.tmp"
+
+    with tmp.open("w", encoding="utf-8") as f:
         for user in users:
             f.write(json.dumps(user.to_dict(), ensure_ascii=False) + "\n")
 
+    # Reemplazo atómico (en Windows funciona como "overwrite")
+    tmp.replace(fpath)
     return fpath
+
