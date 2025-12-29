@@ -21,12 +21,6 @@ __pycache__/
 *.pyd
 
 # ----------------------------
-# Configuración local (NO subir secretos)
-# ----------------------------
-# Nota: config.ini contiene credenciales/URLs/keys de entorno local.
-config.ini
-
-# ----------------------------
 # Archivos de salida / runtime
 # ----------------------------
 # Carpeta estándar de outputs (jsonl, etc.) generados en ejecución
