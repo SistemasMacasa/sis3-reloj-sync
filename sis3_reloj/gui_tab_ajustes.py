@@ -16,33 +16,68 @@ def build_tab_ajustes(parent, *, get_config, set_config_field, log, on_toggle_si
     frame.pack(fill=tk.BOTH, expand=True)
 
     cfg = get_config()
+    sis2_disc_var = tk.BooleanVar(value=bool(getattr(cfg, "sis2_disconnected", False)))
 
-    sis2_disc_var = tk.BooleanVar(value=bool(cfg.sis2_disconnected))
+    # Panel principal (look consistente)
+    card = ttk.LabelFrame(frame, text="Ajustes", padding=(12, 10))
+    card.pack(fill=tk.X, pady=(0, 10))
+
+    # Título/explicación cortita y entendible
+    title = ttk.Label(
+        card,
+        text="Cuando se active este ajuste, el reloj trabajará solo con SIS3.",
+        wraplength=680,
+        justify="left",
+    )
+    title.pack(anchor="w", pady=(0, 8))
+
+    # Checkbox centrado (texto simple)
+    row = ttk.Frame(card)
+    row.pack(fill=tk.X)
 
     chk = ttk.Checkbutton(
-        frame,
-        text="Se ha desconectado SIS2 (modo post-SIS2)",
+        row,
+        text="Activar modo solo SIS3",
         variable=sis2_disc_var,
         command=lambda: _on_toggle(sis2_disc_var, set_config_field, log, on_toggle_sis2_disconnected),
     )
-    chk.pack(anchor="w", pady=(8, 8))
+    chk.pack(anchor="center", pady=(6, 10))
+
+    # Explicación tipo “tarjeta de ayuda” (sin palabras raras)
+    help_box = ttk.LabelFrame(card, text="¿Qué cambia?", padding=(10, 8))
+    help_box.pack(fill=tk.X, pady=(0, 8))
 
     hint = ttk.Label(
-        frame,
-        text="Nota: Este modo solo evita el envío a SIS2. No borra nada del reloj.",
+        help_box,
+        text=(
+            "• Se desactiva SIS2: se oculta la pestaña SIS2 y se bloquea el switch “SIS2 Conectado”.\n"
+            "• A partir de aquí, las checadas se envían a SIS3.\n"
+            "• SIS3 ya podrá limpiar el reloj cuando termine correctamente.\n"
+            "\n"
+            "Tip: Actívalo solo cuando ya estés listo para dejar de usar SIS2."
+        ),
+        justify="left",
+        wraplength=680,
     )
     hint.pack(anchor="w")
-
     return frame
 
 
 def _on_toggle(var, set_config_field, log, on_toggle_sis2_disconnected=None):
     val = bool(var.get())
+
+    # Persistencia en config.ini
     save_mode_sis2_disconnected(val)
+
+    # Estado en memoria (para que GUI reaccione inmediatamente)
     set_config_field("sis2_disconnected", val)
 
-    mode = "POST-SIS2 (SIS2 desactivado)" if val else "COEXISTENCIA con SIS2"
-    log(f"[AJUSTES] Modo cambiado: {mode}")
+    # Mensaje al log en español “normal”
+    if val:
+        log("[AJUSTES] Modo solo SIS3 ACTIVADO: SIS2 se deshabilita y SIS3 podrá limpiar el reloj al finalizar OK.")
+    else:
+        log("[AJUSTES] Modo solo SIS3 DESACTIVADO: SIS2 vuelve a estar disponible.")
 
+    # Callback hacia gui.py para aplicar hide/show tab + bloquear header checkbox
     if callable(on_toggle_sis2_disconnected):
         on_toggle_sis2_disconnected(val)

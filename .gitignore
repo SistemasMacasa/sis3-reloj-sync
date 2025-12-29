@@ -65,3 +65,4 @@ Thumbs.db
 # (Opcional) VS Code / JetBrains si quisieras ignorarlos:
 # .vscode/
 # .idea/
+assets/odbc/*.msi

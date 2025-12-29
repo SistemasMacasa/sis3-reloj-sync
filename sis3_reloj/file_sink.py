@@ -8,7 +8,15 @@ import json
 def ensure_dir(path: Path):
     path.mkdir(parents=True, exist_ok=True)
 
-def write_attendance_jsonl(records: List[AttendanceRecord], base_dir: Path) -> Path:
+def write_attendance_jsonl(records: List[AttendanceRecord], base_dir: Path, *, subdir: str | None = None) -> Path:
+    """
+    Escribe asistencia en JSONL y regresa el path.
+    Compat: permite subdir="sis3"/"sis2" sin romper llamadas viejas.
+    """
+    base_dir = Path(base_dir)
+    if subdir:
+        base_dir = base_dir / subdir
+
     ensure_dir(base_dir)
     now = datetime.now()
     fname = f"asistencia-{now:%Y%m%d-%H%M%S}.jsonl"

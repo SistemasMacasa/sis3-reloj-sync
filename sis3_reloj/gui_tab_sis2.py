@@ -64,32 +64,26 @@ def build_tab_sis2(parent, *, get_conn, get_config, log,
     """
     frame = ttk.Frame(parent, padding=10)
     frame.pack(fill=tk.BOTH, expand=True)
-
     # ─────────────────────────────────────────────
-    # Status bar (visible para operación)
+    # Status bar (tipo tablero, más legible)
     # ─────────────────────────────────────────────
-    status_wrap = ttk.Frame(frame)
+    status_wrap = ttk.LabelFrame(frame, text="Estado de SIS2", padding=(10, 8))
     status_wrap.pack(fill=tk.X, pady=(0, 10))
 
-    lbl_status_title = ttk.Label(status_wrap, text="Estado:")
-    lbl_status_title.grid(row=0, column=0, sticky="w")
-
+    ttk.Label(status_wrap, text="Estado:").grid(row=0, column=0, sticky="w")
     lbl_status = ttk.Label(status_wrap, text="Listo")
-    lbl_status.grid(row=0, column=1, sticky="w", padx=(6, 20))
+    lbl_status.grid(row=0, column=1, sticky="w", padx=(6, 18))
 
-    lbl_last_title = ttk.Label(status_wrap, text="Última ejecución:")
-    lbl_last_title.grid(row=0, column=2, sticky="w")
-
+    ttk.Label(status_wrap, text="Última ejecución:").grid(row=0, column=2, sticky="w")
     lbl_last = ttk.Label(status_wrap, text="—")
-    lbl_last.grid(row=0, column=3, sticky="w", padx=(6, 20))
+    lbl_last.grid(row=0, column=3, sticky="w", padx=(6, 0))
 
-    lbl_summary_title = ttk.Label(status_wrap, text="Resultado:")
-    lbl_summary_title.grid(row=1, column=0, sticky="w", pady=(6, 0))
-
-    lbl_summary = ttk.Label(status_wrap, text="—")
-    lbl_summary.grid(row=1, column=1, columnspan=3, sticky="w", padx=(6, 0), pady=(6, 0))
+    ttk.Label(status_wrap, text="Resultado:").grid(row=1, column=0, sticky="nw", pady=(8, 0))
+    lbl_summary = ttk.Label(status_wrap, text="—", wraplength=620, justify="left")
+    lbl_summary.grid(row=1, column=1, columnspan=3, sticky="w", padx=(6, 0), pady=(8, 0))
 
     status_wrap.columnconfigure(3, weight=1)
+
 
     # ─────────────────────────────────────────────
     # Runner async con lock (anti doble-click / anti freeze)
@@ -111,88 +105,66 @@ def build_tab_sis2(parent, *, get_conn, get_config, log,
 
     if register_probe:
         register_probe(_probe_for_header)
-
     # ─────────────────────────────────────────────
-    # Botones (UX)
+    # Botones (centrados + jerarquía)
     # ─────────────────────────────────────────────
-    # Contenedor para alinear botones a la izquierda
     actions = ttk.Frame(frame)
-    actions.pack(fill=tk.X, pady=(5, 10), anchor="w")
+    actions.pack(fill=tk.X, pady=(6, 10))
 
-    BTN_W = 36  # ancho en "text units" (ajustable)
+    # centrador
+    actions_center = ttk.Frame(actions)
+    actions_center.pack(anchor="center")
 
+    # estilos suaves (solo visual)
+    style = ttk.Style()
+    try:
+        style.configure("SIS2.Primary.TButton", padding=(14, 10))
+        style.configure("SIS2.Secondary.TButton", padding=(14, 10))
+        style.configure("SIS2.Tertiary.TButton", padding=(14, 10))
+    except Exception:
+        pass
+
+    BTN_W = 30
+
+    # (1) Principal: lo más usado
     btn_full = ttk.Button(
-        actions,
-        text="Sincronizar todo (empleados y checadas)",
+        actions_center,
+        text="Sincronizar todo",
         width=BTN_W,
+        style="SIS2.Primary.TButton",
         command=lambda: runner.run("full"),
     )
-    btn_full.pack(anchor="w", pady=(0, 8))
+    btn_full.pack(anchor="center", pady=(0, 10))
 
-    btn_sync_users = ttk.Button(
-        actions,
-        text="Actualizar empleados (altas y cambios)",
-        width=BTN_W,
-        command=lambda: runner.run("sync_users"),
-    )
-    btn_sync_users.pack(anchor="w", pady=(0, 8))
-
+    # (2) Secundario clave: checadas
     btn_read = ttk.Button(
-        actions,
+        actions_center,
         text="Enviar checadas nuevas",
         width=BTN_W,
+        style="SIS2.Secondary.TButton",
         command=lambda: runner.run("attendance"),
     )
-    btn_read.pack(anchor="w", pady=(0, 8))
+    btn_read.pack(anchor="center", pady=(0, 10))
 
-    btn_users = ttk.Button(
-        actions,
-        text="Ver empleados del reloj (solo consulta)",
+    # (3) Secundario: empleados
+    btn_sync_users = ttk.Button(
+        actions_center,
+        text="Actualizar empleados",
         width=BTN_W,
+        style="SIS2.Secondary.TButton",
+        command=lambda: runner.run("sync_users"),
+    )
+    btn_sync_users.pack(anchor="center", pady=(0, 10))
+
+    # (4) Consulta
+    btn_users = ttk.Button(
+        actions_center,
+        text="Ver empleados del reloj",
+        width=BTN_W,
+        style="SIS2.Tertiary.TButton",
         command=lambda: runner.run("read_users"),
     )
-    btn_users.pack(anchor="w", pady=(0, 0))
-
-    # ─────────────────────────────────────────────
-    # Recovery (desde archivos asistencia-*.jsonl)
-    # ─────────────────────────────────────────────
-    reco = ttk.LabelFrame(frame, text="Recovery (desde archivos asistencia-*)")
-    reco.pack(fill=tk.X, pady=(12, 0), anchor="w")
-
-    row1 = ttk.Frame(reco)
-    row1.pack(fill=tk.X, padx=10, pady=(10, 6))
-
-    runner.var_recovery = tk.BooleanVar(value=False)
-    ttk.Checkbutton(row1, text="Activar recovery", variable=runner.var_recovery).pack(side=tk.LEFT)
-
-    ttk.Label(row1, text="Desde (YYYY-MM-DD):").pack(side=tk.LEFT, padx=(16, 6))
-    runner.ent_rec_from = ttk.Entry(row1, width=12)
-    runner.ent_rec_from.insert(0, "2025-12-11")
-    runner.ent_rec_from.pack(side=tk.LEFT)
-
-    ttk.Label(row1, text="Hasta (YYYY-MM-DD):").pack(side=tk.LEFT, padx=(12, 6))
-    runner.ent_rec_to = ttk.Entry(row1, width=12)
-    runner.ent_rec_to.insert(0, "2025-12-15")
-    runner.ent_rec_to.pack(side=tk.LEFT)
-
-    row2 = ttk.Frame(reco)
-    row2.pack(fill=tk.X, padx=10, pady=(0, 10))
-
-    ttk.Button(
-        row2,
-        text="Previsualizar (dry-run)",
-        command=lambda: runner.run("recovery_preview"),
-    ).pack(side=tk.LEFT, padx=(0, 6))
-
-    ttk.Button(
-        row2,
-        text="Reprocesar selección",
-        command=lambda: runner.run("recovery_send"),
-    ).pack(side=tk.LEFT, padx=(0, 6))
-
-    runner.lbl_recovery = ttk.Label(row2, text="Estado: listo")
-    runner.lbl_recovery.pack(side=tk.LEFT, padx=(12, 0))
-
+    btn_users.pack(anchor="center")
     return frame
 
 
@@ -202,15 +174,66 @@ def build_tab_sis2(parent, *, get_conn, get_config, log,
 # ───────────────────────────────────────────────────────────────
 
 def _pending_users_dir(cfg) -> Path:
-    return (BASE_DIR / cfg.output_dir / "sis2" / "pending").resolve()
+    # Ruta canónica: BASE_DIR/<output_dir>/sis2/pending
+    # (y lo logueamos desde _find_latest_pending_users_file)
+    return (BASE_DIR / str(cfg.output_dir) / "sis2" / "pending").resolve()
 
-
-def _find_latest_pending_users_file(cfg) -> Path | None:
+def _find_latest_pending_users_file(cfg, log=None) -> Path | None:
     pend_dir = _pending_users_dir(cfg)
-    if not pend_dir.exists():
-        return None
-    files = sorted(pend_dir.glob("users-pending-*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
-    return files[0] if files else None
+
+    if callable(log):
+        log(f"[SIS2] Buscando pendientes en: {pend_dir}")
+
+    # 1) pending/ (raíz)
+    if pend_dir.exists():
+        files = sorted(
+            pend_dir.glob("users-pending-*.jsonl"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True
+        )
+        if files:
+            if callable(log):
+                log(f"[SIS2] Pendiente encontrado en pending/: {files[0].name}")
+            return files[0]
+
+       # 2) pending/processed/ (solo para DEBUG; en producción idealmente no)
+    if str(getattr(cfg, "debug", "")).lower() in ("1","true","yes","on"):
+        proc_dir = (pend_dir / "processed")
+        if callable(log):
+            log(f"[SIS2] pending/ vacío. Buscando en: {proc_dir}")
+
+        if proc_dir.exists():
+            files2 = sorted(
+                proc_dir.glob("users-pending-*.jsonl"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True
+            )
+            if files2:
+                if callable(log):
+                    log(f"[SIS2] Pendiente encontrado en processed/: {files2[0].name}")
+                return files2[0]
+
+    # 3) Fallback duro (Windows) — por si BASE_DIR/ output_dir apuntan a otro lado
+    try:
+        hard = Path(r"C:\mcrelojchecador\out\sis2\pending\processed")
+        if callable(log):
+            log(f"[SIS2] Fallback Windows: buscando en {hard}")
+        if hard.exists():
+            files3 = sorted(
+                hard.glob("users-pending-*.jsonl"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True
+            )
+            if files3:
+                if callable(log):
+                    log(f"[SIS2] Pendiente encontrado en fallback: {files3[0].name}")
+                return files3[0]
+    except Exception:
+        pass
+
+    if callable(log):
+        log("[SIS2] No se encontraron users-pending-*.jsonl en pending/, processed/ ni fallback.")
+    return None
 
 
 def _parse_jsonl(path: Path) -> list[dict]:
@@ -323,9 +346,9 @@ def _approx_events_in_file(path: Path) -> int:
 # ───────────────────────────────────────────────────────────────
 
 def _sync_users_from_pending_file(ip: str, port: int, password: int, cfg, log) -> dict:
-    pending_file = _find_latest_pending_users_file(cfg)
+    pending_file = _find_latest_pending_users_file(cfg, log=log)
     if not pending_file:
-        log("[SIS2] No se encontró archivo de pendientes en out/sis2/pending (users-pending-*.jsonl).")
+        log("[SIS2] No se encontró archivo de pendientes (users-pending-*.jsonl). Revisa la ruta mostrada arriba en el Log.")
         return {"ok": True, "skipped": True, "reason": "no_pending_file"}
 
     log(f"[SIS2] Pendientes de usuarios: {pending_file}")
@@ -371,8 +394,14 @@ def _sync_users_from_pending_file(ip: str, port: int, password: int, cfg, log) -
             failed += 1
             log(f"[SIS2] ⚠️ Usuario {user_id} acción {action} falló: {e}")
 
-    archived_to = _archive_processed_file(pending_file)
-    log(f"[SIS2] Pendientes procesados. applied={applied}, failed={failed}. Archivo archivado en: {archived_to}")
+    # Si ya viene de /processed, no lo movemos otra vez.
+    if pending_file.parent.name.lower() == "processed":
+        archived_to = pending_file
+        log(f"[SIS2] Pendientes procesados. applied={applied}, failed={failed}. (Ya estaba en processed): {archived_to}")
+    else:
+        archived_to = _archive_processed_file(pending_file)
+        log(f"[SIS2] Pendientes procesados. applied={applied}, failed={failed}. Archivo archivado en: {archived_to}")
+
     return {"ok": failed == 0, "applied": applied, "failed": failed, "archived": str(archived_to)}
 
 
@@ -424,16 +453,19 @@ def _attendance_incremental_pipeline(ip: str, port: int, password: int, cfg, log
         log("[SIS2] Header=DESCONectado → DRY-RUN: se guarda archivo local, no se envía a DB y no se limpia el reloj.")
         return {"ok": True, "skipped": True, "reason": "header_disconnected", "local_path": str(path_local)}
 
-    # 2) Ajustes (post-SIS2): también NO enviar y NO limpiar
+    # 2) Ajustes (post-SIS2):
+    #    Ya no enviamos a SIS2, pero el flujo principal es SIS3.
+    #    La limpieza se decide DESPUÉS, solo si SIS3 confirma OK.
     if cfg.sis2_disconnected:
-        log("[SIS2] SIS2 desconectado (Ajustes / post-SIS2). No se envía a SIS2 y NO se limpia el dispositivo.")
-        return {"ok": True, "skipped": True, "reason": "sis2_disconnected", "local_path": str(path_local)}
+        log("[SIS2] SIS2 desconectado (Ajustes / post-SIS2). No se envía a SIS2 (SIS3 será el flujo principal).")
+
 
     # Política de password DB: ENV tiene prioridad, si no existe usa config.ini
     db_password = (os.getenv("SIS2_DB_PASSWORD") or "").strip() or str(getattr(cfg, "sis2_db_password", "") or "")
     src = "ENV(SIS2_DB_PASSWORD)" if (os.getenv("SIS2_DB_PASSWORD") or "").strip() else "config.ini [sis2_db]"
 
     sink_result = None
+    sis3_result = None
     try:
         sis2_cfg = Sis2Config(
             enabled=bool(cfg.sis2_enabled),
@@ -451,38 +483,96 @@ def _attendance_incremental_pipeline(ip: str, port: int, password: int, cfg, log
             db_trust_server_certificate=bool(getattr(cfg, "sis2_db_trust_server_certificate", True)),
         )
 
-        if not sis2_cfg.db_password:
+        # Si SIS2 sigue activo, sí exigimos password para enviar a SIS2.
+        # Si ya es modo solo SIS3, no debe bloquear.
+        if (not bool(getattr(cfg, "sis2_disconnected", False))) and (not sis2_cfg.db_password):
             log("[SIS2] ❌ Falta contraseña DB. Define SIS2_DB_PASSWORD o [sis2_db] password en config.ini.")
             return {"ok": False, "stage": "sink", "error": "missing_db_password", "local_path": str(path_local)}
 
-        log(f"[SIS2] Sink usando credenciales desde {src}.")
-        sink_result = send_attendance_to_sis2(records, sis2_cfg, log=lambda m: log(f"[SIS2] {m}"))
+
+        # ─────────────────────────────────────────────
+        # 3) Enviar primero a SIS3 (Bridge principal).
+        #    Si SIS3 no confirma OK, NO limpiar el reloj.
+        # ─────────────────────────────────────────────
+        from .sis3_sink import Sis3Config, send_attendance_to_sis3
+
+        sis3_base_url = (os.getenv("SIS3_BASE_URL") or "").strip() or str(getattr(cfg, "sis3_base_url", "") or "")
+        sis3_api_key  = (os.getenv("SIS3_API_KEY") or "").strip() or str(getattr(cfg, "sis3_api_key", "") or "")
+        sis3_timeout  = int((os.getenv("SIS3_TIMEOUT_SEC") or str(getattr(cfg, "sis3_timeout_sec", 20) or 20)).strip() or "20")
+
+        if not sis3_base_url or not sis3_api_key:
+            log("[SIS3] ❌ Falta SIS3_BASE_URL / SIS3_API_KEY (o config.ini). No se envía y NO se limpia.")
+            return {"ok": False, "stage": "sis3_sink", "error": "missing_sis3_config", "local_path": str(path_local)}
+
+        sis3_cfg = Sis3Config(base_url=sis3_base_url, api_key=sis3_api_key, timeout_sec=sis3_timeout)
+        file_tag = Path(str(path_local)).name
+
+        sis3_result = None
+        try:
+            sis3_result = send_attendance_to_sis3(
+                records,
+                sis3_cfg,
+                device_ip=ip,
+                device_port=port,
+                file_tag=file_tag,
+                mode="incremental",
+                log=lambda m: log(f"[SIS3] {m}"),
+            )
+        except Exception as e:
+            log(f"[SIS3] ❌ Error enviando a SIS3: {e}")
+            log("[SIS3] No se limpia el dispositivo (SIS3 no confirmado).")
+            return {"ok": False, "stage": "sis3_sink", "error": str(e), "local_path": str(path_local)}
+
+        # ─────────────────────────────────────────────
+        # 4) (Transición) Enviar también a SIS2 SOLO si SIS2 sigue activo.
+        #    Si ya estamos en modo solo SIS3, SIS2 no se toca.
+        # ─────────────────────────────────────────────
+        if bool(getattr(cfg, "sis2_disconnected", False)):
+            log("[SIS2] Modo solo SIS3 activo → no se envía a SIS2.")
+            sink_result = {"ok": True, "skipped": True, "reason": "sis2_disconnected"}
+        else:
+            log(f"[SIS2] Sink usando credenciales desde {src}.")
+            sink_result = send_attendance_to_sis2(records, sis2_cfg, log=lambda m: log(f"[SIS2] {m}"))
+
+
+
     except Exception as e:
         log(f"[SIS2] SIS2 sink error: {e}")
         sink_result = {"ok": False, "error": str(e)}
 
-    if not (sink_result and sink_result.get("ok") is True):
-        log("[SIS2] No se limpia el dispositivo (sink no confirmado o falló).")
+    # La limpieza depende de SIS3 (no de SIS2).
+    # SIS2 puede fallar temporalmente sin poner en riesgo el flujo principal de SIS3.
+    if not (sis3_result and sis3_result.get("ok") is True):
+        log("[SIS3] No se limpia el dispositivo (SIS3 no confirmado o falló).")
         return {
             "ok": False,
-            "stage": "sink",
+            "stage": "sis3_sink",
+            "sis3": sis3_result,
             "sink": sink_result,
             "local_path": str(path_local),
         }
 
-    # Clear
-    try:
-        log("[SIS2] Sink OK. Limpiando registros de asistencia en el dispositivo...")
-        ok_clear = clear_attendance(ip, port, password)
-    except Exception as e:
-        log(f"[SIS2] ⚠️ Error limpiando dispositivo: {e}")
-        return {"ok": False, "stage": "clear", "error": str(e), "sink": sink_result}
 
-    if not ok_clear:
-        log("[SIS2] ⚠️ Limpieza no confirmada (retorno False). No se actualiza checkpoint.")
-        return {"ok": False, "stage": "clear", "error": "clear_attendance returned False", "sink": sink_result}
+    # ─────────────────────────────────────────────
+    # Política de limpieza:
+    # - Mientras SIS2 esté vivo (cfg.sis2_disconnected=False): NO limpiar
+    # - Cuando SIS2 ya se desconectó (cfg.sis2_disconnected=True): SÍ limpiar tras OK de SIS3
+    # ─────────────────────────────────────────────
+    if not bool(cfg.sis2_disconnected):
+        log("[SIS3] SIS2 sigue activo → NO se limpia el dispositivo (modo transición).")
+    else:
+        try:
+            log("[SIS3] OK confirmado y SIS2 desactivado → limpiando registros de asistencia en el dispositivo...")
+            ok_clear = clear_attendance(ip, port, password)
+        except Exception as e:
+            log(f"[SIS3] ⚠️ Error limpiando dispositivo: {e}")
+            return {"ok": False, "stage": "clear", "error": str(e), "sink": sink_result, "sis3": sis3_result}
 
-    log("[SIS2] ✅ Dispositivo limpiado correctamente.")
+        if not ok_clear:
+            log("[SIS3] ⚠️ Limpieza no confirmada (retorno False). No se actualiza checkpoint.")
+            return {"ok": False, "stage": "clear", "error": "clear_attendance returned False", "sink": sink_result, "sis3": sis3_result}
+
+        log("[SIS3] ✅ Dispositivo limpiado correctamente.")
 
     max_ts = max((r.timestamp for r in records if isinstance(getattr(r, "timestamp", None), datetime)), default=None)
     if max_ts:
@@ -591,8 +681,8 @@ class _SIS2Runner:
         self._running = True
         started_dt = datetime.now()
 
-        self._ui(lambda: self.ui_set_status("Running"))
-        self._ui(lambda: self.ui_set_summary("—"))
+        self._ui(lambda: self.ui_set_status("running"))
+        self._ui(lambda: self.ui_set_summary("Procesando… por favor espera."))
 
         self.log(f"[SIS2] START action={action} @ {started_dt:%Y-%m-%d %H:%M:%S}")
 
@@ -699,191 +789,6 @@ class _SIS2Runner:
                     f"Empleados encontrados en el reloj: {total}\n(Consulta el Log para el detalle)"
                 ))
                 ok = True
-
-            elif action == "recovery_preview":
-                # DRY-RUN: solo analiza archivos asistencia-*.jsonl
-                try:
-                    if not getattr(self, "var_recovery", None) or not self.var_recovery.get():
-                        summary = "Recovery: desactivado"
-                        self._ui(lambda: messagebox.showinfo(
-                            "Listo",
-                            "Activa el checkbox 'Activar recovery' para usar esta función."
-                        ))
-                        ok = True
-                    else:
-                        d_from = _parse_ymd(self.ent_rec_from.get())
-                        d_to = _parse_ymd(self.ent_rec_to.get())
-                        if d_to < d_from:
-                            raise ValueError("Rango inválido: 'Hasta' es menor que 'Desde'.")
-
-                        files = _scan_asistencia_files(cfg)
-                        selected = _filter_asistencia_by_range(files, d_from, d_to)
-                        folder = _asistencia_dir(cfg)
-
-                        if not selected:
-                            self.log(f"[SIS2][RECOVERY] No hay archivos asistencia-* entre {d_from} y {d_to} en: {folder}")
-                            summary = "Recovery: sin archivos"
-                            if getattr(self, "lbl_recovery", None):
-                                self._ui(lambda: self.lbl_recovery.config(text="Estado: sin archivos"))
-                            self._ui(lambda: messagebox.showinfo(
-                                "Listo",
-                                "No encontré archivos para ese rango.\nRevisa fechas y carpeta out/sis2."
-                            ))
-                            ok = True
-                        else:
-                            self._recovery_selected = selected
-
-                            self.log("=================================================")
-                            self.log(f"[SIS2][RECOVERY] DRY-RUN en: {folder}")
-                            self.log(f"[SIS2][RECOVERY] Rango: {d_from} → {d_to}")
-
-                            agg: dict[date, dict] = {}
-                            total_files = 0
-                            total_events = 0
-                            for d, p in selected:
-                                total_files += 1
-                                c = _approx_events_in_file(p)
-                                total_events += c
-                                if d not in agg:
-                                    agg[d] = {"files": 0, "events": 0}
-                                agg[d]["files"] += 1
-                                agg[d]["events"] += c
-
-                            for d in sorted(agg.keys()):
-                                self.log(f"[SIS2][RECOVERY] {d.isoformat()} → archivos={agg[d]['files']} eventos≈{agg[d]['events']}")
-
-                            self.log(f"[SIS2][RECOVERY] TOTAL → archivos={total_files} eventos≈{total_events}")
-                            self.log("=================================================")
-
-                            summary = f"Recovery: listo ({total_files} archivos)"
-                            if getattr(self, "lbl_recovery", None):
-                                self._ui(lambda: self.lbl_recovery.config(text=f"Estado: listo ({total_files} archivos)"))
-                            self._ui(lambda: messagebox.showinfo(
-                                "Listo",
-                                f"Previsualización lista.\nArchivos: {total_files}\nEventos aprox.: {total_events}\nRevisa el Log."
-                            ))
-                            ok = True
-
-                except Exception as e:
-                    self.log(f"[SIS2][RECOVERY] ERROR preview → {e!r}")
-                    summary = "Recovery: error"
-                    if getattr(self, "lbl_recovery", None):
-                        self._ui(lambda: self.lbl_recovery.config(text="Estado: error"))
-                    self._ui(lambda: messagebox.showerror("Error", f"Falló la previsualización:\n{e!r}"))
-                    ok = False
-
-            elif action == "recovery_send":
-                # ENVÍO: reinyecta archivos seleccionados usando el MISMO sink de DB
-                try:
-                    if not getattr(self, "var_recovery", None) or not self.var_recovery.get():
-                        summary = "Recovery: desactivado"
-                        self._ui(lambda: messagebox.showinfo(
-                            "Listo",
-                            "Activa el checkbox 'Activar recovery' para usar esta función."
-                        ))
-                        ok = True
-                    else:
-                        selected = getattr(self, "_recovery_selected", None)
-                        if not selected:
-                            summary = "Recovery: sin selección"
-                            self._ui(lambda: messagebox.showinfo(
-                                "Listo",
-                                "Primero ejecuta 'Previsualizar (dry-run)' para preparar la selección."
-                            ))
-                            ok = True
-                        else:
-                            # Respeta la misma política de conexión que attendance:
-                            if not self._runtime_connected():
-                                self.log("[SIS2][RECOVERY] Header=DESCONectado → no se envía (solo dry-run permitido).")
-                                summary = "Recovery: header desconectado"
-                                self._ui(lambda: messagebox.showinfo(
-                                    "Listo",
-                                    "Header está DESCONectado.\nActívalo para permitir envío."
-                                ))
-                                ok = True
-                            elif cfg.sis2_disconnected:
-                                self.log("[SIS2][RECOVERY] SIS2 desconectado (Ajustes). No se envía.")
-                                summary = "Recovery: sis2_disconnected"
-                                self._ui(lambda: messagebox.showinfo(
-                                    "Listo",
-                                    "SIS2 está marcado como desconectado en Ajustes.\nDesactívalo para permitir envío."
-                                ))
-                                ok = True
-                            else:
-                                db_password = (os.getenv("SIS2_DB_PASSWORD") or "").strip() or str(getattr(cfg, "sis2_db_password", "") or "")
-                                src = "ENV(SIS2_DB_PASSWORD)" if (os.getenv("SIS2_DB_PASSWORD") or "").strip() else "config.ini [sis2_db]"
-
-                                sis2_cfg = Sis2Config(
-                                    enabled=bool(cfg.sis2_enabled),
-                                    mode=str(cfg.sis2_mode),
-                                    drop_dir=(BASE_DIR / str(cfg.sis2_drop_dir)).resolve(),
-                                    base_url=str(cfg.sis2_base_url),
-                                    api_key=str(cfg.sis2_api_key),
-                                    timeout_sec=int(cfg.sis2_timeout_sec),
-
-                                    db_server=str(getattr(cfg, "sis2_db_server", "") or ""),
-                                    db_database=str(getattr(cfg, "sis2_db_database", "admin_macasa_prod") or "admin_macasa_prod"),
-                                    db_username=str(getattr(cfg, "sis2_db_username", "") or ""),
-                                    db_password=db_password,
-                                    db_driver=str(getattr(cfg, "sis2_db_driver", "ODBC Driver 18 for SQL Server") or "ODBC Driver 18 for SQL Server"),
-                                    db_trust_server_certificate=bool(getattr(cfg, "sis2_db_trust_server_certificate", True)),
-                                )
-
-                                if not sis2_cfg.db_password:
-                                    raise RuntimeError("Falta contraseña DB. Define SIS2_DB_PASSWORD o [sis2_db] password en config.ini.")
-
-                                self.log(f"[SIS2][RECOVERY] Sink usando credenciales desde {src}.")
-                                self.log("=================================================")
-                                self.log("[SIS2][RECOVERY] INICIO envío (replay controlado desde archivos)")
-
-                                sent_files = 0
-                                sent_rows = 0
-                                last_err = None
-
-                                for d, p in selected:
-                                    records = _load_attendance_records_from_jsonl(p)
-                                    good = [r for r in records if isinstance(getattr(r, "timestamp", None), datetime)]
-                                    if not good:
-                                        self.log(f"[SIS2][RECOVERY] SKIP {p.name} (0 filas con timestamp válido)")
-                                        continue
-
-                                    res_sink = send_attendance_to_sis2(good, sis2_cfg, log=lambda m: self.log(f"[SIS2] {m}"))
-                                    if not (res_sink and res_sink.get("ok") is True):
-                                        last_err = res_sink
-                                        self.log(f"[SIS2][RECOVERY] ❌ FAIL file={p.name} sink={res_sink}")
-                                        break
-
-                                    sent_files += 1
-                                    sent_rows += len(good)
-                                    self.log(f"[SIS2][RECOVERY] OK {d.isoformat()} file={p.name} filas={len(good)}")
-
-                                self.log(f"[SIS2][RECOVERY] FIN envío → archivos_ok={sent_files} filas_enviadas={sent_rows}")
-                                self.log("=================================================")
-
-                                if last_err:
-                                    summary = "Recovery: error en envío"
-                                    if getattr(self, "lbl_recovery", None):
-                                        self._ui(lambda: self.lbl_recovery.config(text="Estado: error"))
-                                    self._ui(lambda: messagebox.showerror("Error", f"Falló el envío recovery.\nDetalle:\n{last_err}"))
-                                    ok = False
-                                else:
-                                    summary = f"Recovery: enviado ({sent_files} archivos)"
-                                    if getattr(self, "lbl_recovery", None):
-                                        self._ui(lambda: self.lbl_recovery.config(text=f"Estado: enviado ({sent_files} archivos)"))
-                                    self._ui(lambda: messagebox.showinfo(
-                                        "Listo",
-                                        f"Recovery enviado.\nArchivos OK: {sent_files}\nFilas enviadas: {sent_rows}\nRevisa el Log."
-                                    ))
-                                    ok = True
-
-                except Exception as e:
-                    self.log(f"[SIS2][RECOVERY] ERROR send → {e!r}")
-                    summary = "Recovery: error"
-                    if getattr(self, "lbl_recovery", None):
-                        self._ui(lambda: self.lbl_recovery.config(text="Estado: error"))
-                    self._ui(lambda: messagebox.showerror("Error", f"Falló el envío recovery:\n{e!r}"))
-                    ok = False
-
             elif action == "full":
                 started = time.time()
                 self.log(f"[SIS2] Iniciando proceso completo en {ip}:{port} ...")
