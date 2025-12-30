@@ -1,22 +1,32 @@
 # sis3_reloj/gui.py
 import tkinter as tk
 import threading
-import sys
-from tkinter import ttk, messagebox
+from tkinter import ttk
 from pathlib import Path
 
 from .config import load_config, BASE_DIR
-from .odbc_bootstrap import ensure_odbc_driver
 from .gui_tab_sis2 import build_tab_sis2
 from .gui_tab_sis3 import build_tab_sis3
 from .gui_tab_ajustes import build_tab_ajustes
 
 
 class SIS3RelojApp(tk.Tk):
+    """
+    GUI principal.
+
+    Hooks expuestos a pestañas:
+      - set_sis2_badge_state(ok/phase/msg, auto_reset_ms=...)
+      - set_reloj_badge_state(ok/phase/msg, auto_reset_ms=...)
+      - clear_log()
+      - apply_sis2_mode_from_config()
+    """
+
+    LOG_CLEAR_TOKEN = "__CLEAR_LOG__"
+
     def __init__(self):
         super().__init__()
         self.title("SIS3RelojChecador")
-        self.geometry("740x520")
+        self.geometry("740x720")
 
         self.config_obj = load_config()
 
@@ -25,20 +35,25 @@ class SIS3RelojApp(tk.Tk):
         self.port_var = tk.StringVar(value=str(self.config_obj.port))
         self.pass_var = tk.StringVar(value=str(self.config_obj.password))
 
-        # Estado de conexión SIS2 (checkbox header)
-        self.sis2_conn_var = tk.BooleanVar(value=False)
-        self.sis2_probe_fn = None  # se registra desde la pestaña SIS2
-
         # refs notebook/tabs
         self.nb = None
         self.tab_sis2 = None
         self.tab_sis3 = None
         self.tab_ajustes = None
 
-        # widgets header / log
-        self.lbl_sis2_state = None
-        self.chk_sis2 = None
+        # widgets log + badges (creados en UI y “enlazados” aquí)
         self.txt_log = None
+
+        # Badge SIS2 (label dentro del tab SIS2)
+        self.lbl_sis2_state = None
+        self.chk_sis2 = None  # legacy (tolerado)
+
+        # Badge Reloj/Checador (label dentro del header)
+        self.lbl_reloj_state = None
+
+        # after_ids para auto-reset
+        self._sis2_badge_reset_after_id = None
+        self._reloj_badge_reset_after_id = None
 
         # entries header (para habilitar/deshabilitar)
         self.ent_ip = None
@@ -55,10 +70,8 @@ class SIS3RelojApp(tk.Tk):
         root = ttk.Frame(self, padding=10)
         root.pack(fill=tk.BOTH, expand=True)
 
-        # ✅ Estilos ttk para estado SIS2 (badge/pill)
+        # ✅ Estilos ttk para badge SIS2
         style = ttk.Style(self)
-
-        # Badge base (padding y borde)
         try:
             style.configure("SIS2.Badge.TLabel", padding=(10, 4), relief="solid", borderwidth=1)
         except Exception:
@@ -68,7 +81,17 @@ class SIS3RelojApp(tk.Tk):
         style.configure("SIS2.Badge.Connecting.TLabel", foreground="#7c2d12", background="#ffedd5")
         style.configure("SIS2.Badge.Connected.TLabel", foreground="#14532d", background="#dcfce7")
 
-        # Header: panel centrado (global)
+        # ✅ Estilos ttk para badge Reloj/Checador (global en header)
+        try:
+            style.configure("Reloj.Badge.TLabel", padding=(10, 4), relief="solid", borderwidth=1)
+        except Exception:
+            pass
+
+        style.configure("Reloj.Badge.Disconnected.TLabel", foreground="#7f1d1d", background="#fee2e2")
+        style.configure("Reloj.Badge.Connecting.TLabel", foreground="#7c2d12", background="#ffedd5")
+        style.configure("Reloj.Badge.Connected.TLabel", foreground="#14532d", background="#dcfce7")
+
+        # Header: Conexión al reloj
         header = ttk.LabelFrame(root, text="Conexión al reloj", padding=(10, 8))
         header.pack(fill=tk.X)
 
@@ -82,27 +105,18 @@ class SIS3RelojApp(tk.Tk):
 
         ttk.Label(header, text="Password").grid(row=0, column=4, sticky="w")
         self.ent_pass = ttk.Entry(header, textvariable=self.pass_var, width=8, show="•")
-        self.ent_pass.grid(row=0, column=5, sticky="w", padx=(6, 0))
+        self.ent_pass.grid(row=0, column=5, sticky="w", padx=(6, 12))
 
-        # Spacer
+        # spacer
         header.columnconfigure(6, weight=1)
 
-        # Estado (badge/pill)
-        self.lbl_sis2_state = ttk.Label(
+        # ✅ Badge global del checador (socket-like)
+        self.lbl_reloj_state = ttk.Label(
             header,
-            text="SIS2: Desconectado",
-            style="SIS2.Badge.Disconnected.TLabel"
+            text="Reloj: Desconectado",
+            style="Reloj.Badge.Disconnected.TLabel",
         )
-        self.lbl_sis2_state.grid(row=0, column=7, sticky="e", padx=(8, 10))
-
-        # Toggle SIS2
-        self.chk_sis2 = ttk.Checkbutton(
-            header,
-            text="SIS2 Conectado",
-            variable=self.sis2_conn_var,
-            command=self._on_toggle_sis2
-        )
-        self.chk_sis2.grid(row=0, column=8, sticky="e")
+        self.lbl_reloj_state.grid(row=0, column=7, sticky="e")
 
         # Notebook: SIS2 / SIS3 / Ajustes
         self.nb = ttk.Notebook(root)
@@ -130,7 +144,6 @@ class SIS3RelojApp(tk.Tk):
 
         self.txt_log.configure(yscrollcommand=scroll.set)
 
-        # Fuente fija + tags (si el tema lo permite)
         try:
             self.txt_log.configure(font=("Consolas", 10))
         except Exception:
@@ -150,18 +163,24 @@ class SIS3RelojApp(tk.Tk):
         except Exception:
             pass
 
-        # Construir tabs (delegación)
+        # Construir tabs
         build_tab_sis2(
             self.tab_sis2,
             get_conn=self.get_connection,
             get_config=lambda: self.config_obj,
             log=self.log,
-            register_probe=lambda fn: setattr(self, "sis2_probe_fn", fn),
-            set_header_state=self.set_sis2_header_state,
-            # runtime connected REAL: checkbox ON y NO post-SIS2
-            is_sis2_connected=lambda: bool(self.sis2_conn_var.get()) and (not bool(self.config_obj.sis2_disconnected)),
+            # el tab “enlaza” widgets SIS2 al App (badge)
+            bind_sis2_controls=lambda lbl, chk=None: (
+                setattr(self, "lbl_sis2_state", lbl),
+                setattr(self, "chk_sis2", chk),
+            ),
+            # hooks globales
+            ui_set_sis2_badge=self.set_sis2_badge_state,
+            ui_set_reloj_badge=self.set_reloj_badge_state,  # ✅ SOLO aquí (SIS2 usa checador)
+            ui_clear_log=self.clear_log,
         )
 
+        # ❗️IMPORTANTE: NO pasar ui_set_reloj_badge a SIS3 si gui_tab_sis3 no lo acepta
         build_tab_sis3(
             self.tab_sis3,
             get_conn=self.get_connection,
@@ -192,7 +211,7 @@ class SIS3RelojApp(tk.Tk):
 
     def set_header_inputs_enabled(self, enabled: bool):
         """
-        Evita que cambien IP/Port/Password a mitad de un envío/probe.
+        Evita que cambien IP/Port/Password a mitad de un envío/proceso.
         """
         state = "!disabled" if enabled else "disabled"
         for w in (self.ent_ip, self.ent_port, self.ent_pass):
@@ -206,13 +225,40 @@ class SIS3RelojApp(tk.Tk):
                 except Exception:
                     pass
 
+    # -------------------------
+    # Log global
+    # -------------------------
+    def clear_log(self):
+        if self.txt_log is None:
+            return
+        try:
+            self.txt_log.configure(state="normal")
+        except Exception:
+            pass
+        try:
+            self.txt_log.delete("1.0", tk.END)
+        except Exception:
+            pass
+        try:
+            self.txt_log.configure(state="disabled")
+        except Exception:
+            pass
+
     def log(self, msg: str):
+        """
+        También acepta token especial para limpiar log sin acoplar la pestaña al widget:
+          app.log("__CLEAR_LOG__")
+        """
         if self.txt_log is None:
             return
 
         m = (msg or "").strip()
-        tag = None
 
+        if m == self.LOG_CLEAR_TOKEN:
+            self.clear_log()
+            return
+
+        tag = None
         if m.startswith("[SIS2]"):
             tag = "SIS2"
         elif m.startswith("[SIS3]"):
@@ -242,129 +288,161 @@ class SIS3RelojApp(tk.Tk):
             pass
 
     # -------------------------
-    # SIS2: UI state + hide/show
+    # SIS2 badge state (transitorio)
     # -------------------------
-    def set_sis2_header_state(self, ok: bool, msg: str | None = None, phase: str | None = None):
-        """
-        Estado visible (label) = qué está pasando.
-        Checkbox = permiso/acción (permitir o no el envío).
-        """
-        if phase == "connecting":
-            self.lbl_sis2_state.config(text="SIS2: Conectando…", style="SIS2.Badge.Connecting.TLabel")
-        elif ok:
-            self.lbl_sis2_state.config(text="SIS2: Conectado", style="SIS2.Badge.Connected.TLabel")
+    def set_sis2_badge_state(
+        self,
+        ok: bool | None = None,
+        *,
+        phase: str | None = None,
+        msg: str | None = None,
+        auto_reset_ms: int | None = None,
+    ):
+        if self.lbl_sis2_state is None:
+            if msg:
+                self.log(msg)
+            return
+
+        # cancelar auto-reset previo
+        try:
+            if self._sis2_badge_reset_after_id is not None:
+                self.after_cancel(self._sis2_badge_reset_after_id)
+                self._sis2_badge_reset_after_id = None
+        except Exception:
+            self._sis2_badge_reset_after_id = None
+
+        ph = (phase or "").strip().lower()
+
+        if ph == "connecting":
+            try:
+                self.lbl_sis2_state.config(text="SIS2: Conectando…", style="SIS2.Badge.Connecting.TLabel")
+            except Exception:
+                pass
+
+        elif ph == "connected" or ok is True:
+            try:
+                self.lbl_sis2_state.config(text="SIS2: Conectado", style="SIS2.Badge.Connected.TLabel")
+            except Exception:
+                pass
+
+            if auto_reset_ms and int(auto_reset_ms) > 0:
+                def _reset():
+                    try:
+                        self.lbl_sis2_state.config(
+                            text="SIS2: Desconectado",
+                            style="SIS2.Badge.Disconnected.TLabel",
+                        )
+                    except Exception:
+                        pass
+                    self._sis2_badge_reset_after_id = None
+
+                try:
+                    self._sis2_badge_reset_after_id = self.after(int(auto_reset_ms), _reset)
+                except Exception:
+                    self._sis2_badge_reset_after_id = None
+
         else:
-            self.lbl_sis2_state.config(text="SIS2: Desconectado", style="SIS2.Badge.Disconnected.TLabel")
+            try:
+                self.lbl_sis2_state.config(text="SIS2: Desconectado", style="SIS2.Badge.Disconnected.TLabel")
+            except Exception:
+                pass
 
         if msg:
             self.log(msg)
 
-    def _on_toggle_sis2(self):
-        # si SIS2 está “post-SIS2”, no permitir conectar
-        if bool(getattr(self.config_obj, "sis2_disconnected", False)):
-            self.sis2_conn_var.set(False)
-            self.set_sis2_header_state(False, "[SIS2] Desactivado por modo post-SIS2 (Ajustes).")
+    # -------------------------
+    # Reloj/Checador badge state (GLOBAL en header)
+    # -------------------------
+    def set_reloj_badge_state(
+        self,
+        ok: bool | None = None,
+        *,
+        phase: str | None = None,
+        msg: str | None = None,
+        auto_reset_ms: int | None = None,
+    ):
+        """
+        Badge del checador (ZK) como estado transitorio (socket-like):
+          - connecting: durante operación
+          - connected: confirmación breve (si auto_reset_ms)
+          - disconnected: estado por defecto (no hay socket abierto)
+        """
+        if self.lbl_reloj_state is None:
+            if msg:
+                self.log(msg)
             return
 
-        # si lo apagan
-        if not self.sis2_conn_var.get():
-            self.set_sis2_header_state(False, "[SIS2] Estado → Desconectado (por usuario)")
-            return
-
-        # si lo prenden: UI inmediato
-        self.set_sis2_header_state(True, "[SIS2] Estado → Conectando (probe DB)…", phase="connecting")
-
-        # bloquear el toggle e inputs mientras prueba (evita clicks nerviosos y cambios a mitad)
+        # cancelar auto-reset previo
         try:
-            self.chk_sis2.state(["disabled"])
+            if self._reloj_badge_reset_after_id is not None:
+                self.after_cancel(self._reloj_badge_reset_after_id)
+                self._reloj_badge_reset_after_id = None
         except Exception:
-            pass
-        self.set_header_inputs_enabled(False)
+            self._reloj_badge_reset_after_id = None
 
-        def worker():
+        ph = (phase or "").strip().lower()
+
+        if ph == "connecting":
             try:
-                # Si SIS2 está en modo DB, asegurar driver ODBC antes del probe
+                self.lbl_reloj_state.config(text="Reloj: Conectando…", style="Reloj.Badge.Connecting.TLabel")
+            except Exception:
+                pass
+
+        elif ph == "connected" or ok is True:
+            try:
+                self.lbl_reloj_state.config(text="Reloj: Conectado", style="Reloj.Badge.Connected.TLabel")
+            except Exception:
+                pass
+
+            if auto_reset_ms and int(auto_reset_ms) > 0:
+                def _reset():
+                    try:
+                        self.lbl_reloj_state.config(
+                            text="Reloj: Desconectado",
+                            style="Reloj.Badge.Disconnected.TLabel",
+                        )
+                    except Exception:
+                        pass
+                    self._reloj_badge_reset_after_id = None
+
                 try:
-                    sis2_mode = str(getattr(self.config_obj, "sis2_mode", "") or "").strip().lower()
+                    self._reloj_badge_reset_after_id = self.after(int(auto_reset_ms), _reset)
                 except Exception:
-                    sis2_mode = ""
+                    self._reloj_badge_reset_after_id = None
 
-                if sis2_mode == "db":
-                    ok_odbc, msg_odbc = ensure_odbc_driver()
-                    self.after(0, lambda: self.log(f"[APP] {msg_odbc}"))
-                    if not ok_odbc:
-                        def fail_odbc():
-                            self.set_sis2_header_state(False, f"[SIS2] {msg_odbc}")
-                            self.sis2_conn_var.set(False)
-                            try:
-                                self.chk_sis2.state(["!disabled"])
-                            except Exception:
-                                pass
-                            self.set_header_inputs_enabled(True)
-                            messagebox.showerror("Error", msg_odbc)
-                        self.after(0, fail_odbc)
-                        return
+        else:
+            try:
+                self.lbl_reloj_state.config(text="Reloj: Desconectado", style="Reloj.Badge.Disconnected.TLabel")
+            except Exception:
+                pass
 
-                if not callable(self.sis2_probe_fn):
-                    raise RuntimeError("SIS2 probe no disponible")
+        if msg:
+            self.log(msg)
 
-                ok, human = self.sis2_probe_fn()
-
-                def apply_ok():
-                    self.set_sis2_header_state(ok, human)
-                    if not ok:
-                        self.sis2_conn_var.set(False)
-                    try:
-                        self.chk_sis2.state(["!disabled"])
-                    except Exception:
-                        pass
-                    self.set_header_inputs_enabled(True)
-
-                self.after(0, apply_ok)
-
-            except Exception as e:
-                def apply_err():
-                    self.set_sis2_header_state(False, f"[SIS2] ERROR al conectar: {e}")
-                    self.sis2_conn_var.set(False)
-                    try:
-                        self.chk_sis2.state(["!disabled"])
-                    except Exception:
-                        pass
-                    self.set_header_inputs_enabled(True)
-
-                self.after(0, apply_err)
-
-        threading.Thread(target=worker, daemon=True).start()
-
+    # -------------------------
+    # SIS2: hide/show por modo post-SIS2
+    # -------------------------
     def apply_sis2_mode_from_config(self):
         """
         Si sis2_disconnected=True:
           - Oculta pestaña SIS2
-          - Desactiva checkbox header
-          - Fuerza estado desconectado
         Si sis2_disconnected=False:
           - Muestra pestaña SIS2
-          - Habilita checkbox header
         """
         post = bool(getattr(self.config_obj, "sis2_disconnected", False))
 
         if post:
-            # Ocultar pestaña SIS2
             try:
                 self.nb.hide(self.tab_sis2)
             except Exception:
                 pass
 
-            # Deshabilitar header toggle y forzar desconectado
-            try:
-                self.chk_sis2.state(["disabled"])
-            except Exception:
-                pass
-
-            self.sis2_conn_var.set(False)
-            self.set_sis2_header_state(False, "[SIS2] Modo post-SIS2 activo: pestaña SIS2 deshabilitada.")
+            self.set_sis2_badge_state(
+                False,
+                phase="disconnected",
+                msg="[SIS2] Modo post-SIS2 activo: pestaña SIS2 deshabilitada.",
+            )
         else:
-            # Mostrar pestaña SIS2 sin duplicar
             try:
                 tabs = self.nb.tabs()
                 sis2_id = str(self.tab_sis2)
@@ -373,21 +451,11 @@ class SIS3RelojApp(tk.Tk):
             except Exception:
                 pass
 
-            try:
-                self.chk_sis2.state(["!disabled"])
-            except Exception:
-                pass
-
     def on_toggle_sis2_disconnected(self, value: bool):
         """
         Callback desde Ajustes cuando el usuario cambia el modo post-SIS2.
         """
         self.set_config_field("sis2_disconnected", bool(value))
-
-        # Si se activa post-SIS2, forzar OFF el checkbox en caliente
-        if bool(value):
-            self.sis2_conn_var.set(False)
-
         self.apply_sis2_mode_from_config()
 
 
