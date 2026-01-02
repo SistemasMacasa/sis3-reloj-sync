@@ -3,23 +3,24 @@ import os
 import tkinter as tk
 from tkinter import ttk, messagebox
 from datetime import datetime
-from pathlib import Path
-import json
 import time
 import threading
 
-from .sis2_sink import Sis2Config, send_attendance_to_sis2, send_probe_to_sis2_db
+from .config import BASE_DIR
+from .state_store import load_state, save_state, get_state_path
+from .sis2_sink import (
+    Sis2Config,
+    send_attendance_to_sis2,
+    send_probe_to_sis2_db,
+    fetch_pending_personal_from_sis2_db,
+    mark_personal_synced_in_sis2_db,
+)
 from .zk_client import (
     read_attendance,
     read_users,
     clear_attendance,
     upsert_user,
-    delete_user,
 )
-from .file_sink import write_attendance_jsonl
-from .config import BASE_DIR
-from .state_store import load_state, save_state
-
 
 # ───────────────────────────────────────────────────────────────
 # UX: Mensajes humanos
@@ -28,11 +29,11 @@ def _human_reason(reason: str | None) -> str:
     reason = (reason or "").strip()
     mapping = {
         "no_new_records": "No hay checadas nuevas.",
-        "no_pending_file": "No hay cambios de empleados.",
-        "empty_pending_file": "No hay cambios de empleados.",
-        "header_disconnected": "Simulación: se guardó local (no se envió a SIS2).",
-        "sis2_disconnected": "Modo post-SIS2: se guardó local (no se envió a SIS2).",
+        "no_pending_personal": "No hay cambios de empleados.",
+        "sis2_disconnected": "Modo post-SIS2: no se envió a SIS2.",
         "test_mode_no_clear": "Prueba activada: NO se limpió el reloj.",
+        "test_mode_no_mark": "Prueba activada: NO se marcó como sincronizado en SIS2.",
+        "missing_db_password": "Falta contraseña DB.",
     }
     return mapping.get(reason, f"Sin cambios ({reason})" if reason else "Sin cambios.")
 
@@ -61,7 +62,7 @@ def build_tab_sis2(
     is_sis2_connected=None,       # legacy
     bind_sis2_controls=None,      # app enlaza badge
     ui_set_sis2_badge=None,       # app.set_sis2_badge_state(ok, phase=..., msg=..., auto_reset_ms=...)
-    ui_set_reloj_badge=None,      # app.set_reloj_badge_state(ok, phase=..., msg=..., auto_reset_ms=...)  <-- NUEVO
+    ui_set_reloj_badge=None,      # app.set_reloj_badge_state(ok, phase=..., msg=..., auto_reset_ms=...)
     ui_clear_log=None,            # app.clear_log()
 ):
     frame = ttk.Frame(parent, padding=10)
@@ -80,12 +81,11 @@ def build_tab_sis2(
         pass
 
     # ─────────────────────────────────────────────
-    # Card unificada: Estado (SIS2 + Ejecución)
+    # Card: Estado
     # ─────────────────────────────────────────────
     card = ttk.LabelFrame(frame, text="Estado", padding=(10, 10))
     card.pack(fill=tk.X, pady=(0, 10))
 
-    # Row 0: badge + acciones rápidas
     lbl_badge = ttk.Label(
         card,
         text="SIS2: Desconectado",
@@ -104,12 +104,10 @@ def build_tab_sis2(
 
     card.columnconfigure(3, weight=1)
 
-    # separador sutil
     ttk.Separator(card, orient="horizontal").grid(
         row=1, column=0, columnspan=4, sticky="ew", pady=(10, 10)
     )
 
-    # Row 2: estado + última ejecución
     ttk.Label(card, text="Estado:").grid(row=2, column=0, sticky="w")
     lbl_status = ttk.Label(card, text="Listo")
     lbl_status.grid(row=2, column=1, sticky="w", padx=(6, 0))
@@ -118,7 +116,6 @@ def build_tab_sis2(
     lbl_last = ttk.Label(card, text="—")
     lbl_last.grid(row=2, column=3, sticky="w", padx=(6, 0))
 
-    # Row 3: resultado
     ttk.Label(card, text="Resultado:").grid(row=3, column=0, sticky="nw", pady=(8, 0))
     lbl_summary = ttk.Label(card, text="—", wraplength=620, justify="left")
     lbl_summary.grid(row=3, column=1, columnspan=3, sticky="w", padx=(6, 0), pady=(8, 0))
@@ -126,7 +123,6 @@ def build_tab_sis2(
     if callable(bind_sis2_controls):
         bind_sis2_controls(lbl_badge, None)
 
-    # Runner
     runner = _SIS2Runner(
         tk_parent=frame,
         get_conn=get_conn,
@@ -136,12 +132,11 @@ def build_tab_sis2(
         ui_set_last=lambda s: lbl_last.config(text=s),
         ui_set_summary=lambda s: lbl_summary.config(text=s),
         ui_set_sis2_badge=ui_set_sis2_badge,
-        ui_set_reloj_badge=ui_set_reloj_badge,   # <-- NUEVO
+        ui_set_reloj_badge=ui_set_reloj_badge,
         ui_clear_log=ui_clear_log,
         is_test_mode=lambda: bool(test_var.get()),
     )
 
-    # Probe async
     btn_probe.configure(command=lambda: runner.run("probe_db"))
 
     if register_probe:
@@ -200,133 +195,146 @@ def build_tab_sis2(
 
 
 # ───────────────────────────────────────────────────────────────
-# Pendientes usuarios
+# Pipelines (empleados BD→reloj + asistencias incremental)
 # ───────────────────────────────────────────────────────────────
-def _pending_users_dir(cfg) -> Path:
-    return (BASE_DIR / str(cfg.output_dir) / "sis2" / "pending").resolve()
+def _build_sis2_cfg(cfg) -> Sis2Config:
+    db_password = (os.getenv("SIS2_DB_PASSWORD") or "").strip() or str(getattr(cfg, "sis2_db_password", "") or "")
+
+    return Sis2Config(
+        enabled=bool(getattr(cfg, "sis2_enabled", False)),
+        mode=str(getattr(cfg, "sis2_mode", "db")),
+        drop_dir=(BASE_DIR / str(getattr(cfg, "sis2_drop_dir", "out"))).resolve(),
+        base_url=str(getattr(cfg, "sis2_base_url", "") or ""),
+        api_key=str(getattr(cfg, "sis2_api_key", "") or ""),
+        timeout_sec=int(getattr(cfg, "sis2_timeout_sec", 10) or 10),
+        db_server=str(getattr(cfg, "sis2_db_server", "") or ""),
+        db_database=str(getattr(cfg, "sis2_db_database", "admin_macasa_prod") or "admin_macasa_prod"),
+        db_username=str(getattr(cfg, "sis2_db_username", "") or ""),
+        db_password=db_password,
+    )
 
 
-def _find_latest_pending_users_file(cfg, log=None) -> Path | None:
-    pend_dir = _pending_users_dir(cfg)
-    if callable(log):
-        log(f"[SIS2] Buscando pendientes en: {pend_dir}")
+def _users_bd_to_device_pipeline(
+    ip: str,
+    port: int,
+    password: int,
+    cfg,
+    log,
+    *,
+    ui_set_sis2_badge=None,
+    runtime_mark_enabled: bool = True,
+) -> dict:
+    """
+    Lógica legacy: SIS2(DB) -> Checador
+      - Fuente: Tb_Personal (Estatus='A' y SincronizadoEnDispositivo=0)
+      - Identidad: IdPersonal => device.user_id
+      - Nombre: Nombre + ApellidoP + ApellidoM (ya viene armado desde sis2_sink)
+      - PIN: ClaveChecador
+      - Al finalizar OK: marcar SincronizadoEnDispositivo=1 (si runtime_mark_enabled=True)
+    """
+    sis2_cfg = _build_sis2_cfg(cfg)
 
-    if pend_dir.exists():
-        files = sorted(pend_dir.glob("users-pending-*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
-        if files:
-            if callable(log):
-                log(f"[SIS2] Pendiente encontrado en pending/: {files[0].name}")
-            return files[0]
+    if (str(sis2_cfg.mode or "").strip().lower() != "db"):
+        return {"ok": False, "stage": "users", "error": "users_mode_not_db"}
 
-    if str(getattr(cfg, "debug", "")).lower() in ("1", "true", "yes", "on"):
-        proc_dir = pend_dir / "processed"
-        if callable(log):
-            log(f"[SIS2] pending/ vacío. Buscando en: {proc_dir}")
-        if proc_dir.exists():
-            files2 = sorted(proc_dir.glob("users-pending-*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
-            if files2:
-                if callable(log):
-                    log(f"[SIS2] Pendiente encontrado en processed/: {files2[0].name}")
-                return files2[0]
+    if not sis2_cfg.db_password:
+        if callable(ui_set_sis2_badge):
+            ui_set_sis2_badge(False, phase="disconnected", msg="[SIS2] Falta contraseña DB.")
+        return {"ok": False, "stage": "users", "error": "missing_db_password"}
 
-    try:
-        hard = Path(r"C:\mcrelojchecador\out\sis2\pending\processed")
-        if callable(log):
-            log(f"[SIS2] Fallback Windows: buscando en {hard}")
-        if hard.exists():
-            files3 = sorted(hard.glob("users-pending-*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
-            if files3:
-                if callable(log):
-                    log(f"[SIS2] Pendiente encontrado en fallback: {files3[0].name}")
-                return files3[0]
-    except Exception:
-        pass
+    if callable(ui_set_sis2_badge):
+        ui_set_sis2_badge(None, phase="connecting", msg="[SIS2] Leyendo personal pendiente…")
 
-    if callable(log):
-        log("[SIS2] No se encontraron users-pending-*.jsonl en pending/, processed/ ni fallback.")
-    return None
+    pending = fetch_pending_personal_from_sis2_db(
+        sis2_cfg,
+        limit=500,
+        log=lambda m: log(f"[SIS2] {m}"),
+    )
 
-
-def _parse_jsonl(path: Path) -> list[dict]:
-    rows: list[dict] = []
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            rows.append(json.loads(line))
-    return rows
-
-
-def _archive_processed_file(path: Path) -> Path:
-    processed_dir = path.parent / "processed"
-    processed_dir.mkdir(parents=True, exist_ok=True)
-    new_path = processed_dir / path.name
-    try:
-        path.replace(new_path)
-    except Exception:
-        new_path.write_bytes(path.read_bytes())
-        path.unlink(missing_ok=True)
-    return new_path
-
-
-def _sync_users_from_pending_file(ip: str, port: int, password: int, cfg, log) -> dict:
-    pending_file = _find_latest_pending_users_file(cfg, log=log)
-    if not pending_file:
-        log("[SIS2] No se encontró archivo de pendientes (users-pending-*.jsonl). Revisa la ruta mostrada arriba en el Log.")
-        return {"ok": True, "skipped": True, "reason": "no_pending_file"}
-
-    log(f"[SIS2] Pendientes de usuarios: {pending_file}")
-    try:
-        rows = _parse_jsonl(pending_file)
-        if len(rows) == 0:
-            log(f"[SIS2] Pendientes vacío: {pending_file}. No se procesa ni se archiva.")
-            return {"ok": True, "skipped": True, "reason": "empty_pending_file", "path": str(pending_file)}
-    except Exception as e:
-        log(f"[SIS2] ❌ Error leyendo pendientes: {e}")
-        return {"ok": False, "error": f"parse_pending: {e}"}
+    if not pending:
+        if callable(ui_set_sis2_badge):
+            ui_set_sis2_badge(True, phase="connected", msg="[SIS2] Personal: sin cambios.", auto_reset_ms=1200)
+        return {"ok": True, "skipped": True, "reason": "no_pending_personal"}
 
     applied = 0
     failed = 0
+    marked = 0
 
-    for r in rows:
-        action = str(r.get("action", "A")).strip().upper()
-        user_id = str(r.get("user_id", "")).strip()
-        if not user_id:
+    for p in pending:
+        try:
+            idp = int(p.get("IdPersonal"))
+        except Exception:
             failed += 1
             continue
 
-        try:
-            if action == "C":
-                ok = delete_user(ip, port, password, user_id=user_id)
-            else:
-                ok = upsert_user(
-                    ip, port, password,
-                    user_id=user_id,
-                    name=str(r.get("name", "") or ""),
-                    privilege=int(r.get("privilege", 0) or 0),
-                    user_password=str(r.get("password", "") or ""),
-                    card=r.get("card", 0),
-                    enabled=bool(r.get("enabled", True)),
-                )
+        user_id = str(idp)
+        name = str(p.get("full_name") or p.get("FullName") or p.get("nombre_completo") or "").strip()
+        pin = str(p.get("ClaveChecador") or "").strip()
 
-            if ok:
-                applied += 1
-            else:
+        try:
+            privilege = int(p.get("Privilegio") or 0)
+        except Exception:
+            privilege = 0
+
+        try:
+            card = int(p.get("NumeroTarjeta") or 0)
+        except Exception:
+            card = 0
+
+        try:
+            ok_dev = upsert_user(
+                ip, port, password,
+                user_id=user_id,
+                name=name,
+                privilege=privilege,
+                user_password=pin,
+                card=card,
+                enabled=True,
+            )
+            if not ok_dev:
                 failed += 1
+                continue
+
+            applied += 1
+
+            if runtime_mark_enabled:
+                ok_mark = mark_personal_synced_in_sis2_db(
+                    sis2_cfg,
+                    idp,
+                    log=lambda m: log(f"[SIS2] {m}"),
+                )
+                if ok_mark:
+                    marked += 1
+                else:
+                    log(f"[SIS2] ⚠️ No se pudo marcar SincronizadoEnDispositivo=1 para IdPersonal={idp}")
+            else:
+                # Prueba: no marcar en BD
+                pass
 
         except Exception as e:
             failed += 1
-            log(f"[SIS2] ⚠️ Usuario {user_id} acción {action} falló: {e}")
+            log(f"[SIS2] ⚠️ Upsert a reloj falló IdPersonal={idp}: {e}")
 
-    if pending_file.parent.name.lower() == "processed":
-        archived_to = pending_file
-        log(f"[SIS2] Pendientes procesados. applied={applied}, failed={failed}. (Ya estaba en processed): {archived_to}")
-    else:
-        archived_to = _archive_processed_file(pending_file)
-        log(f"[SIS2] Pendientes procesados. applied={applied}, failed={failed}. Archivo archivado en: {archived_to}")
+    ok_all = (failed == 0)
+    if callable(ui_set_sis2_badge):
+        ui_set_sis2_badge(True if ok_all else False,
+                          phase="connected" if ok_all else "disconnected",
+                          msg="[SIS2] Personal: proceso terminado.",
+                          auto_reset_ms=1200)
 
-    return {"ok": failed == 0, "applied": applied, "failed": failed, "archived": str(archived_to)}
+    out = {
+        "ok": ok_all,
+        "applied": applied,
+        "failed": failed,
+        "marked": marked,
+        "count": len(pending),
+        "skipped": False,
+    }
+    if not runtime_mark_enabled:
+        out["test_mode"] = True
+        out["reason"] = "test_mode_no_mark"
+
+    return out
 
 
 def _attendance_incremental_pipeline(
@@ -336,7 +344,7 @@ def _attendance_incremental_pipeline(
     cfg,
     log,
     *,
-    ui_set_sis2_badge=None,   # app.set_sis2_badge_state
+    ui_set_sis2_badge=None,
     runtime_clear_enabled: bool = True,
 ) -> dict:
     log(f"[SIS2] Conectando a {ip}:{port} ...")
@@ -349,13 +357,15 @@ def _attendance_incremental_pipeline(
 
     log(f"[SIS2] Se obtuvieron {len(all_records)} registros de asistencia (crudo).")
 
-    output_dir = (BASE_DIR / cfg.output_dir).resolve()
-    state_path = output_dir / "sis2" / "state.json"
+    # checkpoint global SIS2
+    state_path = get_state_path("sis2")
     state = load_state(state_path)
 
     if not state_path.exists():
         save_state(state_path, state)
         log(f"[SIS2] State creado: {state_path}")
+    else:
+        log(f"[SIS2] State: {state_path}")
 
     log(f"[SIS2] Checkpoint actual: {state.last_ok_ts.isoformat() if state.last_ok_ts else '(vacío)'}")
 
@@ -374,95 +384,75 @@ def _attendance_incremental_pipeline(
         log("[SIS2] No hay registros nuevos. Nada que enviar.")
         return {"ok": True, "skipped": True, "reason": "no_new_records"}
 
-    path_local = write_attendance_jsonl(records, output_dir)
-    log(f"[SIS2] Archivo guardado en: {path_local}")
-
+    # post-SIS2 (no enviamos a DB)
     if bool(getattr(cfg, "sis2_disconnected", False)):
-        log("[SIS2] Modo post-SIS2 activo: se guarda local y NO se envía a SIS2.")
-        return {"ok": True, "skipped": True, "reason": "sis2_disconnected", "local_path": str(path_local)}
+        log("[SIS2] Modo post-SIS2 activo: NO se envía a SIS2.")
+        return {"ok": True, "skipped": True, "reason": "sis2_disconnected", "count": len(records)}
 
-    db_password = (os.getenv("SIS2_DB_PASSWORD") or "").strip() or str(getattr(cfg, "sis2_db_password", "") or "")
-    src = "ENV(SIS2_DB_PASSWORD)" if (os.getenv("SIS2_DB_PASSWORD") or "").strip() else "config.ini [sis2_db]"
-
-    sis2_cfg = Sis2Config(
-        enabled=bool(cfg.sis2_enabled),
-        mode=str(cfg.sis2_mode),
-        drop_dir=(BASE_DIR / str(cfg.sis2_drop_dir)).resolve(),
-        base_url=str(cfg.sis2_base_url),
-        api_key=str(cfg.sis2_api_key),
-        timeout_sec=int(cfg.sis2_timeout_sec),
-        db_server=str(getattr(cfg, "sis2_db_server", "") or ""),
-        db_database=str(getattr(cfg, "sis2_db_database", "admin_macasa_prod") or "admin_macasa_prod"),
-        db_username=str(getattr(cfg, "sis2_db_username", "") or ""),
-        db_password=db_password,
-    )
+    sis2_cfg = _build_sis2_cfg(cfg)
 
     if (str(sis2_cfg.mode or "").strip().lower() == "db") and (not sis2_cfg.db_password):
         log("[SIS2] ❌ Falta contraseña DB. Define SIS2_DB_PASSWORD o [sis2_db] password en config.ini.")
         if callable(ui_set_sis2_badge):
             ui_set_sis2_badge(False, phase="disconnected", msg="[SIS2] Falta contraseña DB.")
-        return {"ok": False, "stage": "sink", "error": "missing_db_password", "local_path": str(path_local)}
+        return {"ok": False, "stage": "sink", "error": "missing_db_password"}
 
     try:
         if callable(ui_set_sis2_badge):
             ui_set_sis2_badge(None, phase="connecting", msg="[SIS2] Conectando a BD…")
-        log(f"[SIS2] Sink usando credenciales desde {src}.")
+
         sink_result = send_attendance_to_sis2(records, sis2_cfg, log=lambda m: log(f"[SIS2] {m}"))
     except Exception as e:
         log(f"[SIS2] ❌ Error enviando a SIS2: {e}")
         if callable(ui_set_sis2_badge):
             ui_set_sis2_badge(False, phase="disconnected", msg="[SIS2] Desconectado (falló envío).")
-        return {"ok": False, "stage": "sis2_sink", "error": str(e), "local_path": str(path_local)}
+        return {"ok": False, "stage": "sis2_sink", "error": str(e)}
 
     if not (sink_result and sink_result.get("ok") is True):
         log("[SIS2] ❌ SIS2 no confirmó OK. No se limpia ni se actualiza checkpoint.")
         if callable(ui_set_sis2_badge):
             ui_set_sis2_badge(False, phase="disconnected", msg="[SIS2] Desconectado (sin confirmación).")
-        return {"ok": False, "stage": "sis2_sink", "sink": sink_result, "local_path": str(path_local)}
+        return {"ok": False, "stage": "sis2_sink", "sink": sink_result}
 
-    # Confirmación breve (socket-like) y volver a desconectado
     if callable(ui_set_sis2_badge):
         ui_set_sis2_badge(True, phase="connected", msg="[SIS2] Envío OK. Conexión cerrada.", auto_reset_ms=1500)
 
+    # Test mode: NO limpiar, pero sí avanzar checkpoint (patrón nuevo)
+    max_ts = max((r.timestamp for r in records if isinstance(getattr(r, "timestamp", None), datetime)), default=None)
     if not runtime_clear_enabled:
-        log("[SIS2] Prueba activada: NO se limpió el reloj. No se actualiza checkpoint.")
-        return {
-            "ok": True,
-            "count": len(records),
-            "local_path": str(path_local),
-            "sink": sink_result,
-            "skipped": True,
-            "reason": "test_mode_no_clear",
-        }
+        log("[SIS2] Prueba activada: NO se limpió el reloj. ✅ Se actualiza checkpoint.")
+        if max_ts:
+            state.last_ok_ts = max_ts
+            save_state(state_path, state)
+            log(f"[SIS2] Checkpoint actualizado (sin limpiar): last_ok_ts={max_ts.isoformat()}")
 
+        return {"ok": True, "count": len(records), "sink": sink_result, "skipped": True, "reason": "test_mode_no_clear"}
+
+    # limpiar reloj
     try:
         log("[SIS2] OK confirmado → limpiando registros de asistencia en el dispositivo...")
         ok_clear = clear_attendance(ip, port, password)
     except Exception as e:
         log(f"[SIS2] ⚠️ Error limpiando dispositivo: {e}")
-        return {"ok": False, "stage": "clear", "error": str(e), "sink": sink_result, "local_path": str(path_local)}
+        return {"ok": False, "stage": "clear", "error": str(e), "sink": sink_result}
 
     if not ok_clear:
         log("[SIS2] ⚠️ Limpieza no confirmada (retorno False). No se actualiza checkpoint.")
-        return {
-            "ok": False,
-            "stage": "clear",
-            "error": "clear_attendance returned False",
-            "sink": sink_result,
-            "local_path": str(path_local),
-        }
+        return {"ok": False, "stage": "clear", "error": "clear_attendance returned False", "sink": sink_result}
 
     log("[SIS2] ✅ Dispositivo limpiado correctamente.")
 
-    max_ts = max((r.timestamp for r in records if isinstance(getattr(r, "timestamp", None), datetime)), default=None)
     if max_ts:
         state.last_ok_ts = max_ts
         save_state(state_path, state)
         log(f"[SIS2] Checkpoint actualizado: last_ok_ts={max_ts.isoformat()}")
 
-    return {"ok": True, "count": len(records), "local_path": str(path_local), "sink": sink_result, "cleared": True}
+    return {"ok": True, "count": len(records), "sink": sink_result, "cleared": True}
 
 
+# ───────────────────────────────────────────────────────────────
+# Runner
+# ───────────────────────────────────────────────────────────────
 class _SIS2Runner:
     def __init__(
         self,
@@ -475,7 +465,7 @@ class _SIS2Runner:
         ui_set_last,
         ui_set_summary,
         ui_set_sis2_badge=None,
-        ui_set_reloj_badge=None,   # <-- NUEVO
+        ui_set_reloj_badge=None,
         ui_clear_log=None,
         is_test_mode=None,
     ):
@@ -489,7 +479,7 @@ class _SIS2Runner:
         self.ui_set_summary = ui_set_summary
 
         self.ui_set_sis2_badge = ui_set_sis2_badge
-        self.ui_set_reloj_badge = ui_set_reloj_badge  # <-- NUEVO
+        self.ui_set_reloj_badge = ui_set_reloj_badge
         self.ui_clear_log = ui_clear_log
         self.is_test_mode = is_test_mode or (lambda: False)
 
@@ -499,32 +489,15 @@ class _SIS2Runner:
     def _ui(self, fn):
         self.tk_parent.after(0, fn)
 
-    # ── SIS2 badge (BD SIS2) ───────────────────────
-    def _badge(
-        self,
-        ok: bool | None,
-        *,
-        phase: str | None = None,
-        msg: str | None = None,
-        auto_reset_ms: int | None = None,
-    ):
+    def _badge(self, ok, *, phase=None, msg=None, auto_reset_ms=None):
         if not callable(self.ui_set_sis2_badge):
             if msg:
                 self.log(msg)
             return
         self._ui(lambda: self.ui_set_sis2_badge(ok, phase=phase, msg=msg, auto_reset_ms=auto_reset_ms))
 
-    # ── Reloj badge (checador ZK) ──────────────────
-    def _reloj_badge(
-        self,
-        ok: bool | None,
-        *,
-        phase: str | None = None,
-        msg: str | None = None,
-        auto_reset_ms: int | None = None,
-    ):
+    def _reloj_badge(self, ok, *, phase=None, msg=None, auto_reset_ms=None):
         if not callable(self.ui_set_reloj_badge):
-            # si no existe hook, no hacemos ruido en log para evitar spam
             return
         self._ui(lambda: self.ui_set_reloj_badge(ok, phase=phase, msg=msg, auto_reset_ms=auto_reset_ms))
 
@@ -545,36 +518,17 @@ class _SIS2Runner:
     def _probe_db_internal(self) -> tuple[bool, str]:
         try:
             cfg = self.get_config()
-
-            db_password = (os.getenv("SIS2_DB_PASSWORD") or "").strip() or str(getattr(cfg, "sis2_db_password", "") or "")
-            src = "ENV(SIS2_DB_PASSWORD)" if (os.getenv("SIS2_DB_PASSWORD") or "").strip() else "config.ini [sis2_db]"
-
-            sis2_cfg = Sis2Config(
-                enabled=bool(cfg.sis2_enabled),
-                mode=str(cfg.sis2_mode),
-                drop_dir=(BASE_DIR / str(cfg.sis2_drop_dir)).resolve(),
-                base_url=str(cfg.sis2_base_url),
-                api_key=str(cfg.sis2_api_key),
-                timeout_sec=int(cfg.sis2_timeout_sec),
-                db_server=str(getattr(cfg, "sis2_db_server", "") or ""),
-                db_database=str(getattr(cfg, "sis2_db_database", "admin_macasa_prod") or "admin_macasa_prod"),
-                db_username=str(getattr(cfg, "sis2_db_username", "") or ""),
-                db_password=db_password,
-            )
+            sis2_cfg = _build_sis2_cfg(cfg)
 
             if not sis2_cfg.db_password:
                 self._badge(False, phase="disconnected", msg="[SIS2] Falta contraseña DB.")
                 return False, "Falta contraseña DB. Define SIS2_DB_PASSWORD o [sis2_db] password en config.ini."
 
-            # Socket-like: connecting durante la operación
             self._badge(None, phase="connecting", msg="[SIS2] Probando conexión a BD…")
-            self.log(f"[SIS2] Probe DB usando credenciales desde {src}…")
-
             res = send_probe_to_sis2_db(sis2_cfg, log=lambda m: self.log(f"[SIS2] {m}"))
             ok = bool(res.get("ok"))
 
             if ok:
-                # Confirmación breve y volver a Desconectado
                 self._badge(True, phase="connected", msg="[SIS2] DB OK. Conexión cerrada.", auto_reset_ms=1500)
                 return True, "Conexión OK a la BD de SIS2."
             else:
@@ -585,17 +539,10 @@ class _SIS2Runner:
             self._badge(False, phase="disconnected", msg=f"[SIS2] Error en probe: {e}")
             return False, f"No se pudo conectar a la BD de SIS2: {e}"
 
-    # Helper para envolver operaciones contra el reloj y mover el badge (socket-like)
     def _run_reloj_op(self, label: str, fn, *, ok_reset_ms: int = 900):
-        """
-        - connecting al iniciar
-        - connected breve al terminar OK (auto_reset_ms)
-        - disconnected al fallar
-        """
         self._reloj_badge(None, phase="connecting", msg=f"[SIS2] Reloj: {label}…")
         try:
             res = fn()
-            # Si fn retorna dict con ok, lo respetamos; si no, asumimos OK (si no lanzó excepción)
             ok = True
             if isinstance(res, dict) and ("ok" in res):
                 ok = bool(res.get("ok"))
@@ -617,7 +564,6 @@ class _SIS2Runner:
         started_dt = datetime.now()
 
         self._clear_log()
-
         self._ui(lambda: self.ui_set_status("running"))
         self._ui(lambda: self.ui_set_summary("Procesando… por favor espera."))
         self.log(f"[SIS2] START action={action} @ {started_dt:%Y-%m-%d %H:%M:%S}")
@@ -690,36 +636,46 @@ class _SIS2Runner:
                 self._ui(lambda: messagebox.showinfo("Listo", f"Asistencias encontradas en el reloj: {total}\n(Consulta el Log para una muestra)"))
 
             elif action == "sync_users":
-                # Si no hay archivo pendiente, no tocamos reloj: seguimos con el comportamiento actual.
-                pending_file = _find_latest_pending_users_file(cfg, log=self.log)
-                if not pending_file:
-                    human = _human_reason("no_pending_file")
+                # Esta operación toca reloj (upsert_user) y DB (leer pendientes + marcar synced)
+                def _op():
+                    return _users_bd_to_device_pipeline(
+                        ip, port, password, cfg, self.log,
+                        ui_set_sis2_badge=lambda ok_, phase=None, msg=None, auto_reset_ms=None: self._badge(
+                            ok_, phase=phase, msg=msg, auto_reset_ms=auto_reset_ms
+                        ),
+                        runtime_mark_enabled=(not bool(self.is_test_mode())),
+                    )
+
+                res = self._run_reloj_op("sincronizando personal (BD→Reloj)", _op, ok_reset_ms=1100)
+
+                if res.get("ok") and res.get("skipped"):
+                    human = _human_reason(res.get("reason"))
                     summary = f"Empleados: {human}"
                     ok = True
                     self._ui(lambda: messagebox.showinfo("Listo", human))
+                elif res.get("ok"):
+                    applied = res.get("applied", 0)
+                    failed = res.get("failed", 0)
+                    marked = res.get("marked", 0)
+
+                    extra = ""
+                    if res.get("test_mode"):
+                        extra = "\n\n" + _human_reason("test_mode_no_mark")
+
+                    summary = f"Empleados: {applied} aplicado(s), {failed} error(es), {marked} marcados en SIS2"
+                    ok = True
+                    self._ui(lambda: messagebox.showinfo(
+                        "Listo",
+                        f"Personal sincronizado.\nAplicados: {applied}\nErrores: {failed}\nMarcados: {marked}{extra}"
+                    ))
                 else:
-                    def _op():
-                        return _sync_users_from_pending_file(ip, port, password, cfg, self.log)
-
-                    res = self._run_reloj_op("sincronizando empleados", _op, ok_reset_ms=900)
-                    ok = bool(res.get("ok"))
-
-                    if res.get("skipped"):
-                        human = _human_reason(res.get("reason"))
-                        summary = f"Empleados: {human}"
-                        ok = True
-                        self._ui(lambda: messagebox.showinfo("Listo", human))
-                    else:
-                        applied = res.get("applied", 0)
-                        failed = res.get("failed", 0)
-                        summary = f"Empleados: {applied} actualizado(s), {failed} con error"
-                        if ok:
-                            self._ui(lambda: messagebox.showinfo("Listo", f"Empleados actualizados.\nActualizados: {applied}\nErrores: {failed}"))
-                        else:
-                            self._ui(lambda: messagebox.showerror("Error", f"No se pudieron actualizar algunos empleados.\n{summary}"))
+                    err = res.get("error") or res.get("stage") or "users"
+                    human = _human_reason(res.get("error")) if res.get("error") in ("missing_db_password",) else str(err)
+                    summary = f"Empleados: ERROR ({human})"
+                    ok = False
+                    self._ui(lambda: messagebox.showerror("Error", f"No se pudo sincronizar personal.\nDetalle: {res}"))
 
             elif action == "attendance":
-                # Esta operación toca reloj (read_attendance y clear_attendance adentro de pipeline)
                 def _op():
                     return _attendance_incremental_pipeline(
                         ip, port, password, cfg, self.log,
@@ -752,7 +708,14 @@ class _SIS2Runner:
                     started = time.time()
                     self.log(f"[SIS2] Iniciando proceso completo en {ip}:{port} ...")
 
-                    users_result = _sync_users_from_pending_file(ip, port, password, cfg, self.log)
+                    users_result = _users_bd_to_device_pipeline(
+                        ip, port, password, cfg, self.log,
+                        ui_set_sis2_badge=lambda ok_, phase=None, msg=None, auto_reset_ms=None: self._badge(
+                            ok_, phase=phase, msg=msg, auto_reset_ms=auto_reset_ms
+                        ),
+                        runtime_mark_enabled=(not bool(self.is_test_mode())),
+                    )
+
                     attendance_result = _attendance_incremental_pipeline(
                         ip, port, password, cfg, self.log,
                         ui_set_sis2_badge=lambda ok_, phase=None, msg=None, auto_reset_ms=None: self._badge(
@@ -760,35 +723,44 @@ class _SIS2Runner:
                         ),
                         runtime_clear_enabled=(not bool(self.is_test_mode())),
                     )
-                    elapsed = time.time() - started
 
+                    elapsed = time.time() - started
                     ok_all = bool(users_result.get("ok")) and bool(attendance_result.get("ok"))
                     summary_all = f"Todo: listo en {elapsed:.1f}s"
 
-                    empleados_msg = (
-                        _human_reason(users_result.get("reason"))
-                        if users_result.get("skipped")
-                        else f"Empleados actualizados: {users_result.get('applied', 0)} | Errores: {users_result.get('failed', 0)}"
-                    )
+                    # Empleados msg
+                    if users_result.get("skipped"):
+                        empleados_msg = _human_reason(users_result.get("reason"))
+                    elif users_result.get("ok"):
+                        empleados_msg = (
+                            f"Empleados: {users_result.get('applied', 0)} aplicados | "
+                            f"{users_result.get('failed', 0)} errores | "
+                            f"{users_result.get('marked', 0)} marcados"
+                        )
+                        if users_result.get("test_mode"):
+                            empleados_msg += " | Prueba: NO marcó en SIS2"
+                    else:
+                        empleados_msg = f"Empleados: ERROR ({users_result.get('error') or 'pipeline'})"
 
+                    # Checadas msg
                     if attendance_result.get("skipped"):
                         checadas_msg = _human_reason(attendance_result.get("reason"))
                     else:
                         checadas_msg = f"Checadas enviadas: {attendance_result.get('count', 0)}"
                         checadas_msg += " | Reloj limpiado" if attendance_result.get("cleared") else " | Reloj NO limpiado"
 
-                    msg = "\n".join(["Sincronización completa finalizada.", f"Tiempo: {elapsed:.1f}s", "", empleados_msg, checadas_msg])
+                    msg = "\n".join([
+                        "Sincronización completa finalizada.",
+                        f"Tiempo: {elapsed:.1f}s",
+                        "",
+                        empleados_msg,
+                        checadas_msg
+                    ])
                     self.log("[SIS2] " + msg.replace("\n", " | "))
 
-                    return {
-                        "ok": ok_all,
-                        "summary": summary_all,
-                        "msg": msg,
-                        "users_result": users_result,
-                        "attendance_result": attendance_result,
-                    }
+                    return {"ok": ok_all, "summary": summary_all, "msg": msg}
 
-                res = self._run_reloj_op("sincronización completa", _op, ok_reset_ms=1100)
+                res = self._run_reloj_op("sincronización completa", _op, ok_reset_ms=1200)
 
                 ok = bool(res.get("ok"))
                 summary = str(res.get("summary") or "Todo: finalizado")

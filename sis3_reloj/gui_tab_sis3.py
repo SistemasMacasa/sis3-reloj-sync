@@ -10,7 +10,7 @@ import threading
 from .zk_client import read_attendance, read_users, clear_attendance
 from .file_sink import write_attendance_jsonl
 from .config import BASE_DIR
-from .state_store import load_state, save_state
+from .state_store import load_state, save_state, get_state_path
 
 from .sis3_sink import Sis3Config, send_attendance_to_sis3, probe_sis3
 
@@ -18,6 +18,7 @@ from .sis3_sink import Sis3Config, send_attendance_to_sis3, probe_sis3
 # ───────────────────────────────────────────────────────────────
 # UX: Mensajes humanos (sin tecnicismos)
 # ───────────────────────────────────────────────────────────────
+
 
 def _human_status(s: str) -> str:
     s = (s or "").strip().lower()
@@ -34,9 +35,9 @@ def _human_reason(reason: str | None) -> str:
     reason = (reason or "").strip()
     mapping = {
         "no_new_records": "No hay checadas nuevas.",
-        "header_disconnected": "Modo simulación: se guardó local (no se envió a SIS3).",
         "missing_sis3_config": "Falta configuración de SIS3 (URL/KEY).",
         "recovery_no_files": "No encontré archivos en ese rango.",
+        "test_mode_no_clear": "Prueba activada: se envió a SIS3 pero NO se limpió el reloj.",
     }
     return mapping.get(reason, f"Sin cambios ({reason})" if reason else "Sin cambios.")
 
@@ -45,20 +46,34 @@ def _human_reason(reason: str | None) -> str:
 # SIS3 config helpers
 # ───────────────────────────────────────────────────────────────
 
+
 def _build_sis3_cfg(cfg):
-    sis3_base_url = (os.getenv("SIS3_BASE_URL") or "").strip() or str(getattr(cfg, "sis3_base_url", "") or "")
-    sis3_api_key = (os.getenv("SIS3_API_KEY") or "").strip() or str(getattr(cfg, "sis3_api_key", "") or "")
-    sis3_timeout = int((os.getenv("SIS3_TIMEOUT_SEC") or str(getattr(cfg, "sis3_timeout_sec", 20) or 20)).strip() or "20")
+    sis3_base_url = (os.getenv("SIS3_BASE_URL") or "").strip() or str(
+        getattr(cfg, "sis3_base_url", "") or ""
+    )
+    sis3_api_key = (os.getenv("SIS3_API_KEY") or "").strip() or str(
+        getattr(cfg, "sis3_api_key", "") or ""
+    )
+    sis3_timeout = int(
+        (
+            os.getenv("SIS3_TIMEOUT_SEC")
+            or str(getattr(cfg, "sis3_timeout_sec", 20) or 20)
+        ).strip()
+        or "20"
+    )
 
     if not sis3_base_url or not sis3_api_key:
         return None, {"ok": False, "error": "missing_sis3_config"}
 
-    return Sis3Config(base_url=sis3_base_url, api_key=sis3_api_key, timeout_sec=sis3_timeout), None
+    return Sis3Config(
+        base_url=sis3_base_url, api_key=sis3_api_key, timeout_sec=sis3_timeout
+    ), None
 
 
 # ───────────────────────────────────────────────────────────────
 # Pipeline SIS3: incremental + local file + send + (optional) clear + checkpoint
 # ───────────────────────────────────────────────────────────────
+
 
 def _attendance_incremental_pipeline_sis3(
     ip: str,
@@ -68,6 +83,7 @@ def _attendance_incremental_pipeline_sis3(
     log,
     *,
     runtime_connected: bool = True,
+    runtime_clear_enabled: bool = True,  # <-- NUEVO (Prueba desactiva limpieza)
 ) -> dict:
     log(f"[SIS3] Conectando a {ip}:{port} ...")
 
@@ -80,22 +96,31 @@ def _attendance_incremental_pipeline_sis3(
     log(f"[SIS3] Se obtuvieron {len(all_records)} registros de asistencia (crudo).")
 
     output_dir = (BASE_DIR / cfg.output_dir).resolve()
-    state_path = (output_dir / "sis3" / "state.json")
+    state_path = get_state_path("sis3")
     state = load_state(state_path)
 
     if not state_path.exists():
         save_state(state_path, state)
         log(f"[SIS3] State creado: {state_path}")
+    else:
+        log(f"[SIS3] State: {state_path}")
 
-    log(f"[SIS3] Checkpoint actual: {state.last_ok_ts.isoformat() if state.last_ok_ts else '(vacío)'}")
+
+    log(
+        f"[SIS3] Checkpoint actual: {state.last_ok_ts.isoformat() if state.last_ok_ts else '(vacío)'}"
+    )
 
     if state.last_ok_ts:
         before = len(all_records)
         records = [
-            r for r in all_records
-            if isinstance(getattr(r, "timestamp", None), datetime) and r.timestamp > state.last_ok_ts
+            r
+            for r in all_records
+            if isinstance(getattr(r, "timestamp", None), datetime)
+            and r.timestamp > state.last_ok_ts
         ]
-        log(f"[SIS3] Incremental activo. Filtrados {before - len(records)}. Nuevos: {len(records)}")
+        log(
+            f"[SIS3] Incremental activo. Filtrados {before - len(records)}. Nuevos: {len(records)}"
+        )
     else:
         records = all_records
         log("[SIS3] Incremental: checkpoint vacío. Se procesan todos.")
@@ -108,15 +133,28 @@ def _attendance_incremental_pipeline_sis3(
     path_local = write_attendance_jsonl(records, output_dir, subdir="sis3")
     log(f"[SIS3] Archivo guardado en: {path_local}")
 
-    # Modo simulación (dry-run): no envío, no clear
+    # Si runtime_connected=False, eso significa "no enviar" (legacy).
+    # OJO: ya NO se usa para 'Prueba'. Prueba solo controla limpieza.
     if not runtime_connected:
-        log("[SIS3] Modo simulación → DRY-RUN: se guarda local, no se envía y no se limpia.")
-        return {"ok": True, "skipped": True, "reason": "header_disconnected", "local_path": str(path_local)}
+        log(
+            "[SIS3] runtime_connected=False → DRY-RUN: se guarda local, no se envía y no se limpia."
+        )
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "header_disconnected",
+            "local_path": str(path_local),
+        }
 
     sis3_cfg, err = _build_sis3_cfg(cfg)
     if err:
         log("[SIS3] ❌ Falta configuración SIS3 (URL/KEY). No se envía y NO se limpia.")
-        return {"ok": False, "stage": "sis3_sink", "error": "missing_sis3_config", "local_path": str(path_local)}
+        return {
+            "ok": False,
+            "stage": "sis3_sink",
+            "error": "missing_sis3_config",
+            "local_path": str(path_local),
+        }
 
     file_tag = Path(str(path_local)).name
     try:
@@ -132,43 +170,125 @@ def _attendance_incremental_pipeline_sis3(
     except Exception as e:
         log(f"[SIS3] ❌ Error enviando a SIS3: {e}")
         log("[SIS3] No se limpia el dispositivo (SIS3 no confirmado).")
-        return {"ok": False, "stage": "sis3_sink", "error": str(e), "local_path": str(path_local)}
+        return {
+            "ok": False,
+            "stage": "sis3_sink",
+            "error": str(e),
+            "local_path": str(path_local),
+        }
 
     if not (sis3_result and sis3_result.get("ok") is True):
         log("[SIS3] No se limpia el dispositivo (SIS3 no confirmado o falló).")
-        return {"ok": False, "stage": "sis3_sink", "sis3": sis3_result, "local_path": str(path_local)}
+        return {
+            "ok": False,
+            "stage": "sis3_sink",
+            "sis3": sis3_result,
+            "local_path": str(path_local),
+        }
 
-    # En transición (SIS2 conectado), NO limpiamos el reloj.
+    # 1) Transición (SIS2 conectado): NO limpiar, pero SÍ actualizamos checkpoint (para evitar reenvíos).
     if not bool(getattr(cfg, "sis2_disconnected", False)):
         log("[SIS3] Transición activa (SIS2 conectado) → NO se limpia el dispositivo.")
-        max_ts = max((r.timestamp for r in records if isinstance(getattr(r, "timestamp", None), datetime)), default=None)
+        max_ts = max(
+            (
+                r.timestamp
+                for r in records
+                if isinstance(getattr(r, "timestamp", None), datetime)
+            ),
+            default=None,
+        )
         if max_ts:
             state.last_ok_ts = max_ts
             save_state(state_path, state)
-            log(f"[SIS3] Checkpoint actualizado (sin limpiar): last_ok_ts={max_ts.isoformat()}")
-        return {"ok": True, "count": len(records), "local_path": str(path_local), "sis3": sis3_result, "no_clear": True}
+            log(
+                f"[SIS3] Checkpoint actualizado (sin limpiar): last_ok_ts={max_ts.isoformat()}"
+            )
+        return {
+            "ok": True,
+            "count": len(records),
+            "local_path": str(path_local),
+            "sis3": sis3_result,
+            "no_clear": True,
+        }
 
-    # Post-transición (SIS2 desconectado): aquí sí limpiamos
+    # 2) Post-transición (SIS2 desconectado): aquí sí podríamos limpiar,
+    #    pero si Prueba está activa, NO limpiamos (patrón SIS2).
+    if not runtime_clear_enabled:
+        log("[SIS3] Prueba activada: NO se limpió el reloj. ✅ Se actualiza checkpoint (nuevo patrón).")
+
+        max_ts = max(
+            (
+                r.timestamp
+                for r in records
+                if isinstance(getattr(r, "timestamp", None), datetime)
+            ),
+            default=None,
+        )
+        if max_ts:
+            state.last_ok_ts = max_ts
+            save_state(state_path, state)
+            log(f"[SIS3] Checkpoint actualizado (prueba, sin limpiar): last_ok_ts={max_ts.isoformat()}")
+
+        return {
+            "ok": True,
+            "count": len(records),
+            "local_path": str(path_local),
+            "sis3": sis3_result,
+            "skipped": True,
+            "reason": "test_mode_no_clear",
+            "no_clear": True,
+        }
+
+    # 3) Limpieza real
     try:
-        log("[SIS3] OK confirmado. Limpiando registros de asistencia en el dispositivo...")
+        log(
+            "[SIS3] OK confirmado. Limpiando registros de asistencia en el dispositivo..."
+        )
         ok_clear = clear_attendance(ip, port, password)
     except Exception as e:
         log(f"[SIS3] ⚠️ Error limpiando dispositivo: {e}")
-        return {"ok": False, "stage": "clear", "error": str(e), "sis3": sis3_result}
+        return {
+            "ok": False,
+            "stage": "clear",
+            "error": str(e),
+            "sis3": sis3_result,
+            "local_path": str(path_local),
+        }
 
     if not ok_clear:
-        log("[SIS3] ⚠️ Limpieza no confirmada (retorno False). No se actualiza checkpoint.")
-        return {"ok": False, "stage": "clear", "error": "clear_attendance returned False", "sis3": sis3_result}
+        log(
+            "[SIS3] ⚠️ Limpieza no confirmada (retorno False). No se actualiza checkpoint."
+        )
+        return {
+            "ok": False,
+            "stage": "clear",
+            "error": "clear_attendance returned False",
+            "sis3": sis3_result,
+            "local_path": str(path_local),
+        }
 
     log("[SIS3] ✅ Dispositivo limpiado correctamente.")
 
-    max_ts = max((r.timestamp for r in records if isinstance(getattr(r, "timestamp", None), datetime)), default=None)
+    max_ts = max(
+        (
+            r.timestamp
+            for r in records
+            if isinstance(getattr(r, "timestamp", None), datetime)
+        ),
+        default=None,
+    )
     if max_ts:
         state.last_ok_ts = max_ts
         save_state(state_path, state)
         log(f"[SIS3] Checkpoint actualizado: last_ok_ts={max_ts.isoformat()}")
 
-    return {"ok": True, "count": len(records), "local_path": str(path_local), "sis3": sis3_result}
+    return {
+        "ok": True,
+        "count": len(records),
+        "local_path": str(path_local),
+        "sis3": sis3_result,
+        "cleared": True,
+    }
 
 
 # ───────────────────────────────────────────────────────────────
@@ -258,7 +378,13 @@ def build_tab_sis3(
         ui_set_last=lambda s: lbl_last.config(text=s),
         ui_set_summary=lambda s: lbl_summary.config(text=s),
         ui_set_sis3_badge=lambda ok, phase=None, msg=None, auto_reset_ms=None: _set_local_sis3_badge(
-            frame, lbl_sis3_badge, ok=ok, phase=phase, msg=msg, auto_reset_ms=auto_reset_ms, log=log
+            frame,
+            lbl_sis3_badge,
+            ok=ok,
+            phase=phase,
+            msg=msg,
+            auto_reset_ms=auto_reset_ms,
+            log=log,
         ),
         ui_set_reloj_badge=ui_set_reloj_badge,
         ui_clear_log=ui_clear_log,
@@ -274,7 +400,7 @@ def build_tab_sis3(
         register_probe(lambda: runner.probe_sis3_for_header())
 
     # ─────────────────────────────────────────────
-    # Tiles (idénticas al grid SIS2)
+    # Tiles
     # ─────────────────────────────────────────────
     tiles = ttk.Frame(frame)
     tiles.pack(fill=tk.X, pady=(6, 10))
@@ -325,6 +451,7 @@ def build_tab_sis3(
     return frame
 
 
+
 def _set_local_sis3_badge(
     tk_parent,
     lbl,
@@ -366,9 +493,13 @@ def _set_local_sis3_badge(
             pass
 
         if auto_reset_ms and int(auto_reset_ms) > 0:
+
             def _reset():
                 try:
-                    lbl.config(text="SIS3: Desconectado", style="SIS3.Badge.Disconnected.TLabel")
+                    lbl.config(
+                        text="SIS3: Desconectado",
+                        style="SIS3.Badge.Disconnected.TLabel",
+                    )
                 except Exception:
                     pass
                 try:
@@ -384,7 +515,9 @@ def _set_local_sis3_badge(
 
     else:
         try:
-            lbl.config(text="SIS3: Desconectado", style="SIS3.Badge.Disconnected.TLabel")
+            lbl.config(
+                text="SIS3: Desconectado", style="SIS3.Badge.Disconnected.TLabel"
+            )
         except Exception:
             pass
 
@@ -407,7 +540,7 @@ class _SIS3Runner:
         ui_set_reloj_badge=None,
         ui_clear_log=None,
         is_test_mode=None,
-        is_sis3_connected=None,   # legacy
+        is_sis3_connected=None,  # legacy
     ):
         self.tk_parent = tk_parent
         self.get_conn = get_conn
@@ -435,40 +568,62 @@ class _SIS3Runner:
         if callable(self.ui_clear_log):
             self._ui(lambda: self.ui_clear_log())
 
-    def _sis3_badge(self, ok: bool | None, *, phase: str | None = None, msg: str | None = None, auto_reset_ms: int | None = None):
+    def _sis3_badge(
+        self,
+        ok: bool | None,
+        *,
+        phase: str | None = None,
+        msg: str | None = None,
+        auto_reset_ms: int | None = None,
+    ):
         if callable(self.ui_set_sis3_badge):
-            self._ui(lambda: self.ui_set_sis3_badge(ok, phase=phase, msg=msg, auto_reset_ms=auto_reset_ms))
+            self._ui(
+                lambda: self.ui_set_sis3_badge(
+                    ok, phase=phase, msg=msg, auto_reset_ms=auto_reset_ms
+                )
+            )
         elif msg:
             self.log(msg)
 
-    def _reloj_badge(self, ok: bool | None, *, phase: str | None = None, msg: str | None = None, auto_reset_ms: int | None = None):
+    def _reloj_badge(
+        self,
+        ok: bool | None,
+        *,
+        phase: str | None = None,
+        msg: str | None = None,
+        auto_reset_ms: int | None = None,
+    ):
         if callable(self.ui_set_reloj_badge):
-            self._ui(lambda: self.ui_set_reloj_badge(ok, phase=phase, msg=msg, auto_reset_ms=auto_reset_ms))
+            self._ui(
+                lambda: self.ui_set_reloj_badge(
+                    ok, phase=phase, msg=msg, auto_reset_ms=auto_reset_ms
+                )
+            )
         elif msg:
             self.log(msg)
 
     def run(self, action: str):
         if self._running:
-            self.log("[SIS3] Pipeline ya está corriendo; ignorando solicitud duplicada.")
+            self.log(
+                "[SIS3] Pipeline ya está corriendo; ignorando solicitud duplicada."
+            )
             return
         t = threading.Thread(target=self._run_guarded, args=(action,), daemon=True)
         t.start()
 
+
     def _runtime_connected(self) -> bool:
         """
-        - Si Prueba está activa -> dry-run (False).
+        ENVÍO a SIS3 (API):
+        - Prueba NO afecta envío (solo limpieza).
         - Si existe legacy is_sis3_connected -> se respeta.
         - Default -> True.
         """
-        if bool(self.is_test_mode()):
-            return False
-
         if callable(self.is_sis3_connected):
             try:
                 return bool(self.is_sis3_connected())
             except Exception:
                 return False
-
         return True
 
     def probe_sis3_for_header(self):
@@ -488,6 +643,8 @@ class _SIS3Runner:
 
         except Exception as e:
             return False, f"[SIS3] Desconectado (error): {e}"
+        
+
 
     def _run_guarded(self, action: str):
         if not self._lock.acquire(blocking=False):
@@ -594,7 +751,7 @@ class _SIS3Runner:
                         summary = "Todo: ERROR (SIS3 no accesible)"
                         ok = False
                         self._ui(lambda: messagebox.showerror("Error", msg))
-                        # cierre limpio (sin excepción extra)
+
                         ended_dt = datetime.now()
                         self._ui(lambda: self.ui_set_last(f"{ended_dt:%Y-%m-%d %H:%M:%S}"))
                         self._ui(lambda: self.ui_set_summary(summary))
@@ -603,11 +760,13 @@ class _SIS3Runner:
 
                     self._sis3_badge(True, phase="connected", msg="[SIS3] API OK. Conexión cerrada.", auto_reset_ms=1500)
 
-                # pipeline
+                # pipeline (ENVÍA SIEMPRE; "Prueba" solo controla limpieza)
                 self._sis3_badge(None, phase="connecting", msg="[SIS3] Enviando a SIS3…")
+
                 res = _attendance_incremental_pipeline_sis3(
                     ip, port, password, cfg, self.log,
                     runtime_connected=self._runtime_connected(),
+                    runtime_clear_enabled=(not bool(self.is_test_mode())),  # Prueba => NO limpiar
                 )
 
                 if res.get("ok"):

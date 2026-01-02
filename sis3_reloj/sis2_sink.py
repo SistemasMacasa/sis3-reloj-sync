@@ -246,8 +246,6 @@ def send_probe_to_sis2_db(cfg: Sis2Config, log: Optional[callable] = None) -> di
     if not cfg.enabled:
         return {"ok": True, "reason": "disabled"}
 
-    _log(f"SIS2(DB-PROBE): abriendo conexión a {cfg.db_server} / {cfg.db_database} ...")
-    cn = _db_connect(cfg)
     try:
         _log(f"SIS2(DB-PROBE): conectando a {cfg.db_server} / {cfg.db_database} ...")
         cn = _db_connect(cfg)
@@ -261,8 +259,327 @@ def send_probe_to_sis2_db(cfg: Sis2Config, log: Optional[callable] = None) -> di
                 _log("SIS2(DB-PROBE): conexión cerrada")
             except Exception:
                 pass
+
         _log("SIS2(DB-PROBE): OK")
         return {"ok": True, "mode": "db"}
+
     except Exception as e:
         _log(f"SIS2(DB-PROBE) ERROR: {e}")
         return {"ok": False, "error": str(e)}
+
+
+# ─────────────────────────────────────────────
+# EMPLEADOS: enviar desde reloj -> SIS2 (Tb_Personal)  [SIN JSONL]
+# ─────────────────────────────────────────────
+
+def _clean_name(name: str) -> str:
+    s = (name or "").strip()
+    return s[:300]  # Tb_Personal.Nombre varchar(300)
+
+
+def _normalize_clave_checador(user_id: str) -> str:
+    """
+    Tb_Personal.ClaveChecador (según tu DDL) es varchar(4).
+    Normalizamos a 4 dígitos:
+      - quitamos espacios
+      - si no es numérico, lo dejamos como string y truncamos/paddeamos a 4
+      - si es numérico, zfill(4) y últimos 4
+    """
+    raw = (str(user_id or "")).strip()
+    if not raw:
+        return ""
+
+    # numérico
+    if raw.isdigit():
+        return raw.zfill(4)[-4:]
+
+    # alfanumérico: dejamos los últimos 4 chars (o pad a la izquierda con 0)
+    raw = raw[-4:]
+    return raw.rjust(4, "0")
+
+
+def _fetch_existing_by_clave(cur, claves: list[str]) -> dict[str, int]:
+    """
+    Devuelve mapping {ClaveChecador -> IdPersonal} para un lote.
+    """
+    claves = [c for c in (claves or []) if c]
+    if not claves:
+        return {}
+
+    placeholders = ",".join(["%s"] * len(claves))
+    sql = f"""
+    SELECT ClaveChecador, IdPersonal
+    FROM dba_mchs.Tb_Personal WITH (NOLOCK)
+    WHERE ClaveChecador IN ({placeholders})
+    """
+    cur.execute(sql, tuple(claves))
+    rows = cur.fetchall() or []
+
+    out: dict[str, int] = {}
+    for r in rows:
+        try:
+            clave = str(r[0] or "").strip()
+            pid = int(r[1])
+            if clave:
+                out[clave] = pid
+        except Exception:
+            pass
+    return out
+
+
+def _send_users_db(users: list, cfg: Sis2Config, _log: callable, *, do_updates: bool = False) -> dict:
+    """
+    Inserta empleados NUEVOS en dba_mchs.Tb_Personal.
+
+    Reglas reales:
+      - IdPersonal es IDENTITY => NO se inserta.
+      - ClaveChecador viene del checador => idempotencia por ClaveChecador.
+      - Estatus SOLO A/C.
+    """
+    rows = []
+    for u in users or []:
+        uid = u.get("user_id") if isinstance(u, dict) else getattr(u, "user_id", None)
+        name = u.get("name") if isinstance(u, dict) else getattr(u, "name", None)
+        priv = u.get("privilege") if isinstance(u, dict) else getattr(u, "privilege", None)
+        card = u.get("card") if isinstance(u, dict) else getattr(u, "card", None)
+        enabled = u.get("enabled") if isinstance(u, dict) else getattr(u, "enabled", True)
+
+        if uid is None or str(uid).strip() == "":
+            continue
+
+        clave = _normalize_clave_checador(str(uid))
+        if not clave:
+            continue
+
+        nombre = _clean_name(str(name or ""))
+
+        try:
+            privilegio = int(priv or 0)
+        except Exception:
+            privilegio = 0
+
+        # Tb_Personal.NumeroTarjeta es int, tu UserRecord.card es string (a veces vacío)
+        numero_tarjeta = 0
+        if str(card or "").strip() != "":
+            try:
+                numero_tarjeta = int(str(card).strip())
+            except Exception:
+                numero_tarjeta = 0
+
+        # Tb_Personal.Estatus acepta: A (activo) / C (cancelado/cerrado)
+        estatus = "A" if bool(enabled) else "C"
+
+        rows.append((clave, nombre, privilegio, numero_tarjeta, estatus))
+
+    if not rows:
+        return {"ok": True, "mode": "db", "inserted": 0, "updated": 0, "skipped": 0, "count": 0}
+
+    inserted = 0
+    updated = 0
+    skipped = 0
+
+    # NOTA: NO se inserta IdPersonal (IDENTITY)
+    sql_insert = """
+    INSERT INTO dba_mchs.Tb_Personal
+      (Nombre, Privilegio, NumeroTarjeta, Estatus, ClaveChecador, FechaAlta, FechaIngreso, SincronizadoEnDispositivo)
+    VALUES
+      (%s, %s, %s, %s, %s, GETDATE(), GETDATE(), 1)
+    """
+
+    sql_update = """
+    UPDATE dba_mchs.Tb_Personal
+    SET
+      Nombre = %s,
+      Privilegio = %s,
+      NumeroTarjeta = %s,
+      Estatus = %s,
+      SincronizadoEnDispositivo = 1
+    WHERE ClaveChecador = %s
+    """
+
+    _log(f"SIS2(DB): conectando a {cfg.db_server} / {cfg.db_database} ...")
+    cn = _db_connect(cfg)
+    _log("SIS2(DB): conexión abierta")
+
+    try:
+        cur = cn.cursor()
+
+        claves = [r[0] for r in rows]
+        existing_map = _fetch_existing_by_clave(cur, claves)
+
+        for (clave, nombre, privilegio, numero_tarjeta, estatus) in rows:
+            if clave in existing_map:
+                if do_updates:
+                    cur.execute(sql_update, (nombre, privilegio, numero_tarjeta, estatus, clave))
+                    updated += 1
+                else:
+                    skipped += 1
+                continue
+
+            cur.execute(sql_insert, (nombre, privilegio, numero_tarjeta, estatus, clave))
+            inserted += 1
+
+        cn.commit()
+
+    except Exception:
+        try:
+            cn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        try:
+            cn.close()
+            _log("SIS2(DB): conexión cerrada")
+        except Exception:
+            pass
+
+    _log(f"SIS2(DB): users inserted={inserted}, updated={updated}, skipped={skipped}, total={len(rows)}")
+    return {
+        "ok": True,
+        "mode": "db",
+        "inserted": inserted,
+        "updated": updated,
+        "skipped": skipped,
+        "count": len(rows),
+        "do_updates": bool(do_updates),
+    }
+
+
+# ─────────────────────────────────────────────
+# EMPLEADOS: SIS2(DB) -> CHECADOR (Fuente BD)
+#   - Detecta pendientes por SincronizadoEnDispositivo=0
+#   - Identidad: IdPersonal (mapea a device.user_id)
+#   - Nombre completo: Nombre + ApellidoP + ApellidoM
+#   - Password/PIN: ClaveChecador
+# ─────────────────────────────────────────────
+
+def _full_name(nombre: str | None, ap_p: str | None, ap_m: str | None) -> str:
+    parts = [str(x).strip() for x in [nombre, ap_p, ap_m] if str(x or "").strip()]
+    return " ".join(parts)[:300]  # Tb_Personal.Nombre varchar(300)
+
+
+def fetch_pending_personal_from_sis2_db(cfg: Sis2Config, *, limit: int = 500, log: Optional[callable] = None) -> list[dict]:
+    """
+    Lee pendientes desde dba_mchs.Tb_Personal:
+      Estatus='A' AND ISNULL(SincronizadoEnDispositivo,0)=0
+    Retorna lista de dicts con campos necesarios para crear/actualizar en el checador.
+    """
+    def _log(msg: str) -> None:
+        if log:
+            log(msg)
+
+    if not cfg.enabled:
+        _log("SIS2: disabled (cfg.enabled=false).")
+        return []
+
+    if (cfg.mode or "").strip().lower() != "db":
+        raise RuntimeError("SIS2(personal): mode debe ser 'db'.")
+
+    cn = _db_connect(cfg)
+    _log("SIS2(DB): conexión abierta (fetch personal pendientes)")
+    try:
+        cur = cn.cursor()
+        sql = f"""
+        SELECT TOP ({int(limit)})
+            IdPersonal,
+            Nombre,
+            ApellidoP,
+            ApellidoM,
+            Estatus,
+            ClaveChecador,
+            Privilegio,
+            NumeroTarjeta
+        FROM dba_mchs.Tb_Personal WITH (NOLOCK)
+        WHERE Estatus = 'A'
+          AND ISNULL(SincronizadoEnDispositivo, 0) = 0
+        ORDER BY ISNULL(FechaAlta, '1900-01-01') ASC, IdPersonal ASC
+        """
+        cur.execute(sql)
+        rows = cur.fetchall() or []
+
+        out: list[dict] = []
+        for r in rows:
+            # pymssql: row es tuple
+            try:
+                idp = int(r[0])
+            except Exception:
+                continue
+
+            nombre = str(r[1] or "")
+            ap_p = str(r[2] or "")
+            ap_m = str(r[3] or "")
+            estatus = str(r[4] or "A").strip().upper()
+
+            clave = str(r[5] or "").strip()  # PIN (varchar(4))
+            try:
+                privilegio = int(r[6] or 0)
+            except Exception:
+                privilegio = 0
+
+            try:
+                tarjeta = int(r[7] or 0)
+            except Exception:
+                tarjeta = 0
+
+            out.append({
+                "IdPersonal": idp,
+                "full_name": _full_name(nombre, ap_p, ap_m),
+                "Privilegio": privilegio,
+                "NumeroTarjeta": tarjeta,
+                "ClaveChecador": clave,
+                "Estatus": estatus,
+            })
+
+        _log(f"SIS2(DB): pendientes personal={len(out)}")
+        return out
+
+    finally:
+        try:
+            cn.close()
+            _log("SIS2(DB): conexión cerrada (fetch personal pendientes)")
+        except Exception:
+            pass
+
+
+def mark_personal_synced_in_sis2_db(cfg: Sis2Config, idpersonal: int, *, log: Optional[callable] = None) -> bool:
+    """
+    Marca SincronizadoEnDispositivo=1 para un IdPersonal.
+    """
+    def _log(msg: str) -> None:
+        if log:
+            log(msg)
+
+    if not cfg.enabled:
+        return True
+
+    if (cfg.mode or "").strip().lower() != "db":
+        raise RuntimeError("SIS2(personal): mode debe ser 'db'.")
+
+    cn = _db_connect(cfg)
+    _log("SIS2(DB): conexión abierta (mark synced)")
+    try:
+        cur = cn.cursor()
+        cur.execute(
+            """
+            UPDATE dba_mchs.Tb_Personal
+            SET SincronizadoEnDispositivo = 1
+            WHERE IdPersonal = %s
+            """,
+            (int(idpersonal),)
+        )
+        cn.commit()
+        return True
+    except Exception as e:
+        try:
+            cn.rollback()
+        except Exception:
+            pass
+        _log(f"SIS2(DB): mark synced ERROR IdPersonal={idpersonal}: {e}")
+        return False
+    finally:
+        try:
+            cn.close()
+            _log("SIS2(DB): conexión cerrada (mark synced)")
+        except Exception:
+            pass
